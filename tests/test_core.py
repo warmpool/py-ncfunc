@@ -1,4 +1,5 @@
 from pathlib import Path
+from typing import Any
 
 import numpy as np
 import pytest
@@ -75,3 +76,48 @@ def test_dim_names() -> None:
 
     with pytest.raises(KeyError):
         ncf.dim_names(TEST_FILE, "no-such-variable")
+
+
+def test_attr_names() -> None:
+    assert ncf.attr_names(TEST_FILE, "sst") == (
+        "standard_name",
+        "long_name",
+        "units",
+        "_FillValue",
+        "missing_value",
+        "cell_methods",
+    )
+
+    root_attrs = ncf.attr_names(TEST_FILE, "/")
+
+    for some_attr in ("creator_name", "creator_email", "creator_type"):
+        assert some_attr in root_attrs
+
+
+def test_attr_val() -> None:
+
+    def sub_test(path: str, var_name: str, gold: dict[str, Any]) -> None:
+        for attr_name, attr_val in gold.items():
+            assert ncf.attr_val(path, var_name, attr_name) == attr_val
+
+    sub_test(
+        TEST_FILE,
+        "time",
+        gold={
+            "standard_name": "time",
+            "long_name": "Time",
+            "units": "days since 1850-01-15 00:00",
+            "calendar": "gregorian",
+            "axis": "T",
+        },
+    )
+
+    sub_test(
+        TEST_FILE,
+        "/",
+        gold={
+            "creator_name": "Boyin Huang",
+            "creator_email": "boyin.huang@noaa.gov",
+            "creator_type": "group",
+        },
+    )

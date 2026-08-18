@@ -51,7 +51,9 @@ class DatasetMeta:
                 self.attributes = {name: h.getncattr(name) for name in h.ncattrs()}
 
         except Exception as e:  # noqa: BLE001
-            raise RuntimeError(f"{e!r}\nnetcdf4 library is unable to read {path!s}")
+            raise RuntimeError(
+                f"{e!r}\nnetcdf4 library is unable to read the file: {path!s}\n(see message above)"
+            )
 
     @staticmethod
     def _to_cache_key(path: PathLike) -> str:
@@ -75,20 +77,56 @@ class DatasetMeta:
             return DatasetMeta(path)
 
 
-# ------------------------------------------------------------------
+# ------------- helpers ---------------
 
 
-def var_names(path: PathLike) -> tuple[str, ...]:
+def _get_variable_metas(path: PathLike, var_name: str) -> VariableMeta:
     ds = DatasetMeta.try_from_cache(path)
-    return tuple(ds.variables.keys())
 
-
-def dim_names(path: PathLike, var_name: str) -> tuple[str, ...]:
-    ds = DatasetMeta.try_from_cache(path)
     try:
-        return ds.variables[var_name].dimensions
+        return ds.variables[var_name]
 
     except KeyError:
         raise KeyError(
             f"'{var_name}' is not a variable name in {path!s} {tuple(ds.variables.keys())!s}"
         )
+
+
+def _get_attribute_metas(path: PathLike, var_name: str) -> dict[str, Any]:
+    if var_name == "/":  # root attributes
+        ds = DatasetMeta.try_from_cache(path)
+        return ds.attributes
+
+    else:
+        return _get_variable_metas(path, var_name).attributes
+
+
+def var_names(path: PathLike) -> tuple[str, ...]:
+    """get the variable names in the file"""
+    ds = DatasetMeta.try_from_cache(path)
+    return tuple(ds.variables.keys())
+
+
+def dim_names(path: PathLike, var_name: str) -> tuple[str, ...]:
+    """get the dimension names of a variable in the file"""
+    return _get_variable_metas(path, var_name).dimensions
+
+
+def attr_names(path: PathLike, var_name: str) -> tuple[str, ...]:
+    """
+    get the attribute names of
+        the file       if var_name == '/'
+        the variable   else
+    """
+    attributes = _get_attribute_metas(path, var_name)
+    return tuple(attributes.keys())
+
+
+def attr_val(path: PathLike, var_name: str, attr_name: str):
+    """
+    get the attribute values of
+        the file       if var_name == '/'
+        the variable   else
+    """
+    attributes = _get_attribute_metas(path, var_name)
+    return attributes[attr_name]
