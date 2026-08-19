@@ -2,6 +2,7 @@ from pathlib import Path
 from typing import Any
 
 import datenum as dn
+import netCDF4 as nc
 import numpy as np
 import pytest
 
@@ -13,11 +14,32 @@ TEST_FILE = "tests/ersst_2022-2024.nc"
 TEST_FILE_LINK = "../ncplot/tests/data/file1.nc"
 
 
+@pytest.fixture
+def tmp_nc(tmp_path: Path) -> Path:
+    """Create a temporary NetCDF file with sample data."""
+    path = tmp_path / "test.nc"
+    with nc.Dataset(path, "w") as h:
+        h.createDimension("x", 5)
+        h.createDimension("y", 3)
+        h.createDimension("t", 4)
+        var = h.createVariable("data", np.float32, ("t", "y", "x"))
+        var[:] = np.random.rand(4, 3, 5)
+        h.createVariable("lon", np.float64, ("x",))
+        h["lon"][:] = np.arange(5)
+        h.createVariable("lat", np.float64, ("y",))
+        h["lat"][:] = np.arange(3)
+        h.createVariable("time", np.float64, ("t",))
+        h["time"][:] = np.arange(4)
+        h["time"].units = "days since 2020-01-01"
+        h["time"].calendar = "standard"
+        h.setncattr("title", "test file")
+    return path
+
+
 # ---- helpers ---
 def test_abort_missing_file() -> None:
-    core._abort_missing_path(Path(TEST_FILE))
     with pytest.raises(FileNotFoundError):
-        core._abort_missing_path(Path("no-such-path"))
+        core.DatasetMeta("no-such-path")
 
 
 def test_meta_data() -> None:
@@ -203,3 +225,89 @@ def test_read_within() -> None:
     )
     assert dims[0][0] == dn.from_ymd(2024, 1, 15)
     assert dims[0][-1] == dn.from_ymd(2024, 12, 15)
+
+
+# ---- write tests ----
+def test_write_attr(tmp_nc: Path) -> None:
+    core.write_attr(tmp_nc, "data", "long_name", "test data")
+    assert ncf.attr_val(tmp_nc, "data", "long_name") == "test data"
+
+    with nc.Dataset(tmp_nc, "a") as h:
+        h.setncattr("author", "tester")
+    assert ncf.attr_val(tmp_nc, "/", "author") == "tester"
+
+    with pytest.raises((KeyError, FileNotFoundError)):
+        core.write_attr(tmp_nc, "nonexistent", "attr", "val")
+
+
+def test_write(tmp_nc: Path) -> None:
+    original = ncf.read(tmp_nc, "data")
+    core.write(tmp_nc, "data", original)
+    assert np.array_equal(ncf.read(tmp_nc, "data"), original)
+
+    subset_data = original[:2, :3, :5]
+    core.write(tmp_nc, "data", subset_data, (slice(0, 2), slice(0, 3), slice(0, 5)))
+    assert np.array_equal(ncf.read(tmp_nc, "data", (slice(0, 2), slice(0, 3), slice(0, 5))), subset_data)
+
+    with pytest.raises(ValueError):
+        core.write(tmp_nc, "data", np.array([]))
+
+    with pytest.raises(ValueError):
+        core.write(tmp_nc, "data", np.zeros((2, 2)))
+
+    with pytest.raises(ValueError):
+        core.write(tmp_nc, "data", np.zeros((2, 3, 5)), (slice(0),))
+
+
+def test_create(tmp_nc: Path) -> None:
+    core.create(tmp_nc, "data", {"t": 4, "y": 3, "x": 5})
+    assert "data" in ncf.var_names(tmp_nc)
+
+    new_path = tmp_nc.parent / "new.nc"
+    with nc.Dataset(new_path, "w") as h:
+        h.createDimension("time", 10)
+    core.create(new_path, "time", {"time": 10})
+    assert "time" in ncf.var_names(new_path)
+
+    with pytest.raises(ValueError):
+        core.create(tmp_nc, "data", {"t": 99, "y": 99, "x": 99})
+
+
+def test_set_my_attrs(tmp_nc: Path) -> None:
+    with nc.Dataset(tmp_nc, "a") as h:
+        core._set_my_attrs(h, "lon")
+        assert h["lon"].axis == "X"
+        assert h["lon"].units == "degrees_east"
+
+        core._set_my_attrs(h, "lat")
+        assert h["lat"].axis == "Y"
+        assert h["lat"].units == "degrees_north"
+
+        core._set_my_attrs(h, "time")
+        assert h["time"].axis == "T"
+        assert h["time"].units == "days since 2000-01-01 00:00:00"
+
+
+def test_read_nonexistent_var(tmp_nc: Path) -> None:
+    with pytest.raises(KeyError):
+        ncf.read(tmp_nc, "nonexistent")
+
+
+def test_read_within_mismatched_ndim(tmp_nc: Path) -> None:
+    with pytest.raises(ValueError):
+        ncf.read_within(tmp_nc, "data", ((1, 2),))
+
+
+def test_read_within_idim_time_with_decode_false(tmp_nc: Path) -> None:
+    with pytest.raises(ValueError):
+        ncf.read_within(tmp_nc, "data", ((None, None),) * 3, idim_time=0, decode_time=False)
+
+
+def test_read_within_idim_time_out_of_range(tmp_nc: Path) -> None:
+    with pytest.raises(IndexError):
+        ncf.read_within(tmp_nc, "data", ((None, None),) * 3, idim_time=99)
+
+
+def test_attr_val_nonexistent(tmp_nc: Path) -> None:
+    with pytest.raises(KeyError):
+        ncf.attr_val(tmp_nc, "data", "nonexistent_attr")

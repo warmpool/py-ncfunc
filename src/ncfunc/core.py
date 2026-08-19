@@ -1,16 +1,12 @@
 from dataclasses import dataclass, field
+from functools import partial
 from pathlib import Path
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 
 import netCDF4 as nc
 import numpy as np
 
 PathLike = str | Path
-
-
-def _abort_missing_path(path: Path) -> None:
-    if not path.is_file():
-        raise FileNotFoundError(str(path))
 
 
 # -------------metadata assets-----------------------
@@ -217,26 +213,28 @@ def _guess_time_name(path: str | PathLike) -> str:
         )
 
 
-# ---- reader ----
+# ---- readers ----
 def read(
     path: PathLike, var_name: str, subsets: tuple[slice, ...] | None = None
 ) -> np.ndarray:
-    var_meta = _get_variable_meta(
-        path, var_name
-    )  # check var_name here and hide the KeyError inside
-    if subsets is not None:
-        received = len(subsets)
-        expected = var_meta.ndim
-        if received != expected:
-            raise ValueError(
-                f"length of input slices does not match ndim(variable), {expected=} {received=}"
-            )
+    # check var_name here and hide the KeyError inside
+    var_meta = _get_variable_meta(path, var_name)
 
     with nc.Dataset(path, "r") as h:
         if subsets is None:
             data = h[var_name][:]
         else:
-            data = h[var_name][subsets]
+            try:
+                data = h[var_name][subsets]
+            except Exception as e:  # noqa: BLE001
+                raise RuntimeError(
+                    f"{e!r}\nunable to read {var_name=}({var_meta.shape}) with {subsets=} from {path!s}"
+                )
+
+    if any(s == 0 for s in data.shape):
+        raise ValueError(
+            f"an empty array of {data.shape} is read with the given {subsets=} for {var_name=}({var_meta.shape}) in {path!r}"
+        )
 
     return np.array(data)
 
@@ -499,3 +497,155 @@ def read_within(
     )
 
     return value, dims
+
+
+# ---- writers ----
+def _set_my_attrs(h_file: nc.Dataset, name: str):
+    h = h_file[name]
+    if name.lower() in ("lon", "longitude", "longitudes"):
+        h.axis = "X"
+        h.units = "degrees_east"
+        h.long_name = "longitude"
+        h.standard_name = "longitude"
+
+    if name.lower() in ("lat", "latitude", "latitudes"):
+        h.axis = "Y"
+        h.units = "degrees_north"
+        h.long_name = "latitude"
+        h.standard_name = "latitude"
+
+    if name.lower() in (
+        "lev",
+        "level",
+        "levs",
+        "levels",
+        "pressure",
+        "plev",
+        "dep",
+        "depth",
+        "depths",
+    ):
+        h.axis = "Z"
+
+    if any(guess in name.lower() for guess in ("time", "date")):
+        h.axis = "T"
+        h.units = "days since 2000-01-01 00:00:00"
+        h.long_name = "time"
+        h.standard_name = "time"
+
+
+def write_attr(path: PathLike, var_name: str, attr_name: str, attr_val: str) -> None:
+    # hide the KeyError and FileNotFoundError here
+    _get_variable_meta(path, var_name)
+    with nc.Dataset(path, "a") as h_file:
+        if attr_name == "/":
+            h_file.setncattr(attr_name, attr_val)
+        else:
+            setattr(h_file[var_name], attr_name, attr_val)
+
+
+def write(
+    path: PathLike,
+    var_name: str,
+    data: np.ndarray,
+    subsets: tuple[slice, ...] | None = None,
+) -> None:
+    if any(s == 0 for s in data.shape):
+        raise ValueError(
+            f"I'm not going to help you write an empty data of shape={data.shape} to {var_name=} in {path!s}"
+        )
+
+    # check var_name here and hide the and FileNotFoundError KeyError inside
+    var_meta = _get_variable_meta(path, var_name)
+
+    # check the data shape
+    if subsets is None and var_meta.shape != data.shape:
+        raise ValueError(
+            f"data shapes are different in the input and the file. input={data.shape}, file={var_meta.shape}. {var_name=} in {path!s}"
+        )
+
+    elif subsets is not None:
+        # check the ndim
+        received = len(subsets)
+        expected = var_meta.ndim
+        if received != expected:
+            raise ValueError(
+                f"length of input slices does not match ndim(variable), {expected=} {received=}"
+            )
+
+    with nc.Dataset(path, "a") as h:
+        if subsets is None:
+            h[var_name][:] = data
+        else:
+            try:
+                h[var_name][subsets] = data
+            except Exception as e:  # noqa: BLE001
+                raise RuntimeError(
+                    f"{e!r}\nunable to write {var_name}({data.shape}) with {subsets=} to {var_names}({var_meta.shape}) in  {path!s}"
+                )
+
+
+def create(
+    path: PathLike,
+    var_name: str,
+    dim_specs: dict[str, int],
+    use_my_attrs: bool = True,
+    significant_digits: None | int = None,
+    dtype: nc.DatatypeType = np.float32,
+    complevel: Literal[0, 1, 2, 3, 4, 5, 6, 7, 8, 9] | None = 4,
+    shuffle: bool = True,
+):
+    """create a varaible and its dimensions in a file if any of them do not exist yet"""
+    shape = tuple(dim_specs.values())
+    dim_names = tuple(dim_specs.keys())
+
+    # ---- check the consistency of shape and dimnames if variable already exists
+    try:
+        var_meta = _get_variable_meta(path, var_name)
+    except KeyError, FileNotFoundError:
+        var_meta = None
+
+    if var_meta is not None:  # if the var_name exists in the file
+        if shape != var_meta.shape:
+            raise ValueError(
+                f"The shape of the {var_name=} is different in the input ({shape}) and the existing file ({var_meta.shape}) in {path!s}"
+            )
+        elif dim_names != var_meta.dimensions:
+            raise ValueError(
+                f"The dimension names of the {var_name=} is different in the input ({dim_names}) and the existing file ({var_meta.dimensions}) in {path!s}"
+            )
+        else:  # everythin checks and nothing to do here
+            return
+
+    # ---- create the dimensions
+    try:
+        existing_names = var_names(path)
+    except FileNotFoundError:
+        existing_names = ()
+
+    # ---- prepare specs that need to be created
+    missing_spec = {
+        name: (shape if name == var_name else (dim_specs[name],))
+        for name in dict.fromkeys((*dim_names, var_name))
+        if name not in existing_names
+    }
+
+    with nc.Dataset(path, "a") as h_file:
+        for name, shape in missing_spec.items():
+            # create dimension and write attributes first
+            if name in dim_specs:
+                h_file.createDimension(name, shape[0])
+                if use_my_attrs:
+                    _set_my_attrs(h_file, name)
+                create_var = h_file.createVariable
+
+            else:
+                create_var = partial(
+                    h_file.createVariable,
+                    significant_digits=significant_digits,
+                    compression="zlib",
+                    complevel=complevel,
+                    shuffle=shuffle,
+                )
+
+            create_var(var_name, dtype, dim_names)
