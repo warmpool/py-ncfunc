@@ -1,3 +1,5 @@
+import warnings
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
@@ -9,7 +11,7 @@ import numpy as np
 PathLike = str | Path
 
 
-# -------------metadata assets-----------------------
+# --------------metadata assets-----------------------
 @dataclass
 class VariableMeta:
     shape: tuple[int, ...]
@@ -25,6 +27,7 @@ class DatasetMeta:
     variables: dict[str, VariableMeta]
     attributes: dict[str, Any]
     cached_registry: ClassVar[dict[str, DatasetMeta]] = {}
+    MAX_CACHE: ClassVar[int] = 64
 
     def __init__(self, path: PathLike) -> None:
         path = Path(path)
@@ -33,6 +36,13 @@ class DatasetMeta:
 
         self.mtime = path.stat().st_mtime
         self._read(path)
+
+        for __, key in zip(  # uncaching the old entries
+            range(len(self.cached_registry) - self.MAX_CACHE), self.cached_registry
+        ):
+            self.cached_registry.pop(key)
+
+        # -- caching
         self.cached_registry[DatasetMeta._to_cache_key(path)] = self
 
     def _read(self, path: Path) -> None:
@@ -62,6 +72,7 @@ class DatasetMeta:
 
     @staticmethod
     def try_from_cache(path: PathLike, cache_only: bool = False) -> DatasetMeta:
+        path = Path(path)
         key = DatasetMeta._to_cache_key(path)
         ds = DatasetMeta.cached_registry.get(key)
 
@@ -71,14 +82,15 @@ class DatasetMeta:
         if ds is None:
             return DatasetMeta(path)
 
-        if ds.mtime == Path(path).stat().st_mtime:
+        if ds.mtime == path.stat().st_mtime:
             return ds
 
         else:
-            return DatasetMeta(path)
+            ds._read(path)
+            return ds
 
 
-# ------------- helpers ---------------
+# -------------- helpers ---------------
 def _get_variable_meta(path: PathLike, var_name: str) -> VariableMeta:
     ds = DatasetMeta.try_from_cache(path)
 
@@ -100,7 +112,7 @@ def _get_attribute_metas(path: PathLike, var_name: str) -> dict[str, Any]:
         return _get_variable_meta(path, var_name).attributes
 
 
-# ---------- metat data queries ------
+# ----------- metat data queries ------
 def var_names(path: PathLike) -> tuple[str, ...]:
     """get the variable names in the file"""
     ds = DatasetMeta.try_from_cache(path)
@@ -118,7 +130,7 @@ def shape(path: PathLike, var_name: str) -> tuple[int, ...]:
 
 
 def ndim(path: PathLike, var_name: str) -> int:
-    """get the shape of a variable in the file"""
+    """get the ndim (rank) of a variable in the file"""
     return len(_get_variable_meta(path, var_name).shape)
 
 
@@ -213,7 +225,7 @@ def _guess_time_name(path: str | PathLike) -> str:
         )
 
 
-# ---- readers ----
+# ----- readers ----
 def read(
     path: PathLike, var_name: str, subsets: tuple[slice, ...] | None = None
 ) -> np.ndarray:
@@ -227,8 +239,8 @@ def read(
             try:
                 data = h[var_name][subsets]
             except Exception as e:  # noqa: BLE001
-                raise RuntimeError(
-                    f"{e!r}\nunable to read {var_name=}({var_meta.shape}) with {subsets=} from {path!s}"
+                raise ValueError(
+                    f"{e!r}\nunable to read {var_name=}{var_meta.shape} with {subsets=} from {path!s}"
                 )
 
     if any(s == 0 for s in data.shape):
@@ -248,8 +260,8 @@ def read_time(
 ) -> np.ndarray:
     import datenum as dn
 
-    # ---------------------------------
-    # --- auto configure the parameters
+    # ----------------------------------
+    # ---- auto configure the parameters
 
     time_name = time_name or _guess_time_name(path)
 
@@ -268,8 +280,8 @@ def read_time(
 
     subset = subset or slice(None)
 
-    # ---------------------------------
-    # --- parse the time units to delta and epoch
+    # ----------------------------------
+    # ---- parse the time units to delta and epoch
     units = attr_val(path, time_name, unit_name)
     if not isinstance(units, str):
         raise TypeError(
@@ -284,8 +296,8 @@ def read_time(
 
     str_epoch = str_epoch.strip()
 
-    # ---------------------------------
-    # --- delta string -> value
+    # ----------------------------------
+    # ---- delta string -> value
     str_delta = str_delta.strip()
 
     dict_delta = {
@@ -311,15 +323,15 @@ def read_time(
             f"{e!r}\nunrecognized {str_delta=} ({time_name=}, {unit_name=}, {path!s})"
         )
 
-    # ---------------------------------
-    # --- epoch string -> value
+    # ----------------------------------
+    # ---- epoch string -> value
     if str_epoch == "1-1-1 00:00:00":  # weird origin time (CMIP6 models)
         epoch = dn.from_ymd(1, 1, 1)
     else:
         epoch = dn.from_string(str_epoch)
 
-    # ---------------------------------
-    # ---- lazy guess the calendar name here
+    # ----------------------------------
+    # ----- lazy guess the calendar name here
     if delta_method == "day" and calendar_name is None:
         calander_name_guesses = ("calendar", "Calendar", "CALENDAR")
         try:
@@ -345,10 +357,7 @@ def read_time(
 
     time_value = read(path, time_name, (subset,))
     if delta_method == "month":
-        return dn.add_month(epoch, time_value)
-
-    elif delta_method == "year":
-        return dn.add_month(epoch, time_value * 12)
+        return dn.add_month(epoch, time_value * delta)
 
     elif calendar not in ("365_day", "365_days", "360_day", "360_days"):
         return epoch + time_value * delta
@@ -357,26 +366,19 @@ def read_time(
 
         year_epoch = dn.year(epoch)
         remainder_epoch = epoch - dn.from_ymd(year_epoch, 1, 1)
-        ret = []
 
-        for value in time_value:
-            year, remainder = int(value // days_per_year), value % days_per_year
+        years = year_epoch + time_value // days_per_year
+        remainders = remainder_epoch + time_value % days_per_year
 
-            year += year_epoch
-            remainder += remainder_epoch
+        cross_year = remainders >= days_per_year
+        years[cross_year] += 1
+        remainders[cross_year] -= days_per_year
 
-            if remainder > days_per_year:
-                year += 1
-                remainder -= days_per_year
+        datenums = dn.from_ymd(years, 1, 1) + remainders
 
-            t = dn.from_ymd(year, 1, 1) + remainder
-            # get rid of the extra day from Feb29
-            if remainder >= 59 and dn.is_leap_year(t):
-                t += 1
-
-            ret.append(t)
-
-        return np.array(ret)
+        # get rid of the extra day from Feb29
+        datenums[remainders >= 59 & dn.is_leap_year(datenums)] += 1
+        return datenums
 
 
 def read_within(
@@ -421,8 +423,8 @@ def read_within(
         """
 
         bot, top = within
-        bot = bot or -np.inf
-        top = top or np.inf
+        bot = bot if bot is not None else -np.inf
+        top = top if top is not None else np.inf
 
         if bot > top:
             raise ValueError(f"value1 > value2 in {within} does not make sense")
@@ -453,10 +455,10 @@ def read_within(
             )
 
         diff = values[1:] - values[:-1]
-        if all(diff >= 0):
+        if np.all(diff >= 0):
             is_reversed = False
 
-        elif all(diff <= 0):
+        elif np.all(diff <= 0):
             is_reversed = True
 
         else:
@@ -464,9 +466,10 @@ def read_within(
                 f"dimension value sometimes increases and sometimes decreases. {dim_name=} {path!s}"
             )
 
-        if any(diff == 0):
-            print(
-                f"warning: some dimension values does not increase or decrease in {dim_name=} {path!s}"
+        if np.any(diff == 0):
+            warnings.warn(
+                f"some dimension values does not increase or decrease in {dim_name=} {path!s}",
+                RuntimeWarning,
             )
 
         if is_reversed:
@@ -499,7 +502,7 @@ def read_within(
     return value, dims
 
 
-# ---- writers ----
+# ----- writers ----
 def _set_my_attrs(h_file: nc.Dataset, name: str):
     h = h_file[name]
     if name.lower() in ("lon", "longitude", "longitudes"):
@@ -534,11 +537,11 @@ def _set_my_attrs(h_file: nc.Dataset, name: str):
         h.standard_name = "time"
 
 
-def write_attr(path: PathLike, var_name: str, attr_name: str, attr_val: str) -> None:
+def write_attr(path: PathLike, var_name: str, attr_name: str, attr_val: Any) -> None:
     # hide the KeyError and FileNotFoundError here
     _get_variable_meta(path, var_name)
     with nc.Dataset(path, "a") as h_file:
-        if attr_name == "/":
+        if var_name == "/":
             h_file.setncattr(attr_name, attr_val)
         else:
             setattr(h_file[var_name], attr_name, attr_val)
@@ -581,7 +584,7 @@ def write(
                 h[var_name][subsets] = data
             except Exception as e:  # noqa: BLE001
                 raise RuntimeError(
-                    f"{e!r}\nunable to write {var_name}({data.shape}) with {subsets=} to {var_names}({var_meta.shape}) in  {path!s}"
+                    f"{e!r}\nunable to write {var_name}({data.shape}) with {subsets=} to {var_name}({var_meta.shape}) in  {path!s}"
                 )
 
 
@@ -599,10 +602,10 @@ def create(
     shape = tuple(dim_specs.values())
     dim_names = tuple(dim_specs.keys())
 
-    # ---- check the consistency of shape and dimnames if variable already exists
+    # ----- check the consistency of shape and dimnames if variable already exists
     try:
         var_meta = _get_variable_meta(path, var_name)
-    except KeyError, FileNotFoundError:
+    except (KeyError, FileNotFoundError) as __:
         var_meta = None
 
     if var_meta is not None:  # if the var_name exists in the file
@@ -617,13 +620,13 @@ def create(
         else:  # everythin checks and nothing to do here
             return
 
-    # ---- create the dimensions
+    # ----- create the dimensions
     try:
         existing_names = var_names(path)
     except FileNotFoundError:
         existing_names = ()
 
-    # ---- prepare specs that need to be created
+    # ----- prepare specs that need to be created
     missing_spec = {
         name: (shape if name == var_name else (dim_specs[name],))
         for name in dict.fromkeys((*dim_names, var_name))
@@ -635,9 +638,8 @@ def create(
             # create dimension and write attributes first
             if name in dim_specs:
                 h_file.createDimension(name, shape[0])
-                if use_my_attrs:
-                    _set_my_attrs(h_file, name)
                 create_var = h_file.createVariable
+                sub_dim_names = (name,)
 
             else:
                 create_var = partial(
@@ -647,5 +649,79 @@ def create(
                     complevel=complevel,
                     shuffle=shuffle,
                 )
+                sub_dim_names = dim_names
 
-            create_var(var_name, dtype, dim_names)
+            create_var(name, dtype, sub_dim_names)
+
+            if use_my_attrs and name in dim_specs:
+                _set_my_attrs(h_file, name)
+
+
+def save(
+    path: PathLike,
+    data: dict[str, np.ndarray | Iterable],
+    overwrite: bool = False,
+    use_my_attrs: bool = True,
+    significant_digits: None | int = None,
+    dtype: nc.DatatypeType = np.float32,
+    complevel: Literal[0, 1, 2, 3, 4, 5, 6, 7, 8, 9] | None = 4,
+    shuffle: bool = True,
+):
+    """
+    call create() and write() to save a variable to the file
+    data = {
+        var_name: var_data,
+        dim1_name: dim1_data,
+        ...
+        dimN_name: dimN_data,
+    }
+    """
+    try:
+        var_meta = _get_variable_meta(path, next(iter(data.keys())))
+    except (FileNotFoundError, KeyError) as __:
+        var_meta = None
+
+    # data check -- can cast to array?
+    data_casted = {}
+    for name, value in data.items():
+        try:
+            data_casted[name] = np.asarray(value)
+
+        except Exception as e:  # noqa: BLE001
+            raise ValueError(f"{e!r}\nUnable to casting data of '{name}' to an array")
+
+    # data check -- is dim ndim=1 valid?
+    for i, (name, value) in enumerate(data_casted.items()):
+        if (
+            (len(data_casted) == 1 and i == 0)  # the only entry (variable == dimension)
+            or (i > 0)  # the dimensions
+        ) and value.ndim != 1:
+            raise ValueError(
+                f"expecting dimension {name}.ndim==1 but found (shape={*value.shape})"
+            )
+
+        if any(s == 0 for s in value.shape):
+            raise ValueError(
+                f"I'm not going to help you write an empty data of shape={value.shape} to {name=}"
+            )
+
+    # ---- assign parameters to create and write functions
+    names = tuple(data_casted.keys())
+
+    if len(names) == 1:
+        dim_names = names[0]
+    else:
+        dim_names = names[1:]
+
+    dim_specs = {name: len(data_casted[name]) for name in dim_names}
+
+    create(
+        path,
+        names[0],
+        dim_specs,
+        use_my_attrs,
+        significant_digits,
+        dtype,
+        complevel,
+        shuffle,
+    )

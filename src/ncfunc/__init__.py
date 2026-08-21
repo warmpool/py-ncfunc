@@ -1,6 +1,9 @@
 from .core import (
+    DatasetMeta,
     attr_names,
+    attr_names_include,
     attr_val,
+    create,
     dim_names,
     ndim,
     read,
@@ -9,11 +12,16 @@ from .core import (
     shape,
     var_names,
     var_names_include,
+    write,
+    write_attr,
 )
 
 __all__ = [
+    "DatasetMeta",
     "attr_names",
+    "attr_names_include",
     "attr_val",
+    "create",
     "dim_names",
     "ndim",
     "read",
@@ -22,4 +30,6 @@ __all__ = [
     "shape",
     "var_names",
     "var_names_include",
+    "write",
+    "write_attr",
 ]

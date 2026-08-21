@@ -1,3 +1,4 @@
+import warnings
 from pathlib import Path
 from typing import Any
 
@@ -16,20 +17,24 @@ TEST_FILE_LINK = "../ncplot/tests/data/file1.nc"
 
 @pytest.fixture
 def tmp_nc(tmp_path: Path) -> Path:
+    warnings.filterwarnings("ignore", category=DeprecationWarning)
     """Create a temporary NetCDF file with sample data."""
     path = tmp_path / "test.nc"
     with nc.Dataset(path, "w") as h:
         h.createDimension("x", 5)
         h.createDimension("y", 3)
         h.createDimension("t", 4)
-        var = h.createVariable("data", np.float32, ("t", "y", "x"))
-        var[:] = np.random.rand(4, 3, 5)
+
         h.createVariable("lon", np.float64, ("x",))
         h["lon"][:] = np.arange(5)
         h.createVariable("lat", np.float64, ("y",))
         h["lat"][:] = np.arange(3)
         h.createVariable("time", np.float64, ("t",))
         h["time"][:] = np.arange(4)
+
+        var = h.createVariable("data", np.float32, ("t", "y", "x"))
+        var[:] = np.random.rand(4, 3, 5)
+
         h["time"].units = "days since 2020-01-01"
         h["time"].calendar = "standard"
         h.setncattr("title", "test file")
@@ -174,6 +179,8 @@ def test_var_name_includes() -> None:
 
     with pytest.raises(ValueError):
         ncf.core.var_names_include(TEST_FILE, ("sst",), (1,))
+
+    with pytest.raises(ValueError):
         ncf.core.var_names_include(TEST_FILE, ("sst",), (3,))
 
 
@@ -185,6 +192,7 @@ def test_attr_name_includes() -> None:
     )
 
 
+# ---- read test ----
 def test_read() -> None:
     with pytest.raises(ValueError):
         ncf.read(TEST_FILE, "sst", (slice(0), slice(0)))
@@ -247,7 +255,9 @@ def test_write(tmp_nc: Path) -> None:
 
     subset_data = original[:2, :3, :5]
     core.write(tmp_nc, "data", subset_data, (slice(0, 2), slice(0, 3), slice(0, 5)))
-    assert np.array_equal(ncf.read(tmp_nc, "data", (slice(0, 2), slice(0, 3), slice(0, 5))), subset_data)
+    assert np.array_equal(
+        ncf.read(tmp_nc, "data", (slice(0, 2), slice(0, 3), slice(0, 5))), subset_data
+    )
 
     with pytest.raises(ValueError):
         core.write(tmp_nc, "data", np.array([]))
@@ -265,9 +275,13 @@ def test_create(tmp_nc: Path) -> None:
 
     new_path = tmp_nc.parent / "new.nc"
     with nc.Dataset(new_path, "w") as h:
-        h.createDimension("time", 10)
-    core.create(new_path, "time", {"time": 10})
+        h.createDimension("time", 5)
+        h.createVariable("time", np.float32, {"time": 5})
+    core.create(new_path, "time", {"time": 5})
+    core.create(new_path, "var", {"time": 5, "y": 2, "x": 3})
     assert "time" in ncf.var_names(new_path)
+    assert ncf.shape(new_path, "var") == (5, 2, 3)
+    assert ncf.dim_names(new_path, "var") == ("time", "y", "x")
 
     with pytest.raises(ValueError):
         core.create(tmp_nc, "data", {"t": 99, "y": 99, "x": 99})
@@ -300,7 +314,9 @@ def test_read_within_mismatched_ndim(tmp_nc: Path) -> None:
 
 def test_read_within_idim_time_with_decode_false(tmp_nc: Path) -> None:
     with pytest.raises(ValueError):
-        ncf.read_within(tmp_nc, "data", ((None, None),) * 3, idim_time=0, decode_time=False)
+        ncf.read_within(
+            tmp_nc, "data", ((None, None),) * 3, idim_time=0, decode_time=False
+        )
 
 
 def test_read_within_idim_time_out_of_range(tmp_nc: Path) -> None:
