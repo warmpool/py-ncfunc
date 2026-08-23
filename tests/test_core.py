@@ -1,3 +1,4 @@
+import os
 import warnings
 from pathlib import Path
 from typing import Any
@@ -253,6 +254,9 @@ def test_write(tmp_nc: Path) -> None:
     core.write(tmp_nc, "data", original)
     assert np.array_equal(ncf.read(tmp_nc, "data"), original)
 
+    core.write(tmp_nc, "data", original.tolist())  # array-like input
+    assert np.array_equal(ncf.read(tmp_nc, "data"), original)
+
     subset_data = original[:2, :3, :5]
     core.write(tmp_nc, "data", subset_data, (slice(0, 2), slice(0, 3), slice(0, 5)))
     assert np.array_equal(
@@ -327,3 +331,141 @@ def test_read_within_idim_time_out_of_range(tmp_nc: Path) -> None:
 def test_attr_val_nonexistent(tmp_nc: Path) -> None:
     with pytest.raises(KeyError):
         ncf.attr_val(tmp_nc, "data", "nonexistent_attr")
+
+
+# ---- save tests ----
+def _fresh_file(path: Path) -> Path:
+    """create an empty netcdf file"""
+    with nc.Dataset(path, "w"):
+        pass
+    return path
+
+
+def test_save_new_variable(tmp_path: Path) -> None:
+    path = _fresh_file(tmp_path / "new.nc")
+
+    data = {
+        "sst": np.random.rand(4, 3).astype(np.float32),
+        "time": np.arange(4),
+        "lat": np.arange(3),
+    }
+    core.save(path, data)
+
+    # note: create() makes dimension variables first and the variable last
+    assert ncf.var_names(path) == ("time", "lat", "sst")
+    assert ncf.dim_names(path, "sst") == ("time", "lat")
+    assert ncf.shape(path, "sst") == (4, 3)
+
+    for name, value in data.items():
+        assert np.array_equal(ncf.read(path, name), value)
+
+    assert ncf.attr_val(path, "time", "axis") == "T"
+    assert ncf.attr_val(path, "time", "units") == "days since 2000-01-01 00:00:00"
+    assert ncf.attr_val(path, "lat", "axis") == "Y"
+    assert ncf.attr_val(path, "lat", "units") == "degrees_north"
+
+
+def test_save_single_entry_var_is_dim(tmp_path: Path) -> None:
+    path = _fresh_file(tmp_path / "new.nc")
+
+    lon = [1.0, 2.0, 3.0]
+    data = {"lon": lon}
+    core.save(path, data)
+
+    assert ncf.var_names(path) == ("lon",)
+    assert ncf.shape(path, "lon") == (3,)
+    assert np.array_equal(ncf.read(path, "lon"), [1.0, 2.0, 3.0])
+
+    assert data["lon"] is lon  # the input dict must not be mutated
+
+
+def test_save_dtype_option(tmp_path: Path) -> None:
+    path = _fresh_file(tmp_path / "new.nc")
+
+    core.save(path, {"v": np.arange(5)}, dtype=np.float64)
+
+    assert ncf.read(path, "v").dtype == np.float64
+
+
+def test_save_creates_missing_file(tmp_path: Path) -> None:
+    path = tmp_path / "absent.nc"
+    data = {"v": [1.0, 2.0]}
+
+    core.save(path, data)
+
+    assert path.exists()
+    assert ncf.var_names(path) == ("v",)
+    assert np.array_equal(ncf.read(path, "v"), [1.0, 2.0])
+
+
+def test_save_overwrite_confirmed(
+    tmp_nc: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    core.save(tmp_nc, {"vec": [1.0, 2.0, 3.0]})
+
+    monkeypatch.setattr("builtins.input", lambda *_: "y")
+    core.save(tmp_nc, {"vec": [9.0, 8.0, 7.0]})
+
+    assert np.array_equal(ncf.read(tmp_nc, "vec"), [9.0, 8.0, 7.0])
+
+
+def test_save_overwrite_declined(tmp_nc: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    core.save(tmp_nc, {"vec": [1.0, 2.0, 3.0]})
+
+    answers = iter(["maybe", "", "n"])  # garbage first to exercise the retry loop
+    monkeypatch.setattr("builtins.input", lambda *_: next(answers))
+    with pytest.raises(FileExistsError):
+        core.save(tmp_nc, {"vec": [9.0, 8.0, 7.0]})
+
+    assert np.array_equal(ncf.read(tmp_nc, "vec"), [1.0, 2.0, 3.0])
+
+
+def test_save_overwrite_forced(tmp_nc: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    core.save(tmp_nc, {"vec": [1.0, 2.0, 3.0]})
+
+    def no_input(*_: Any) -> str:
+        raise AssertionError("input() must not be called")
+
+    monkeypatch.setattr("builtins.input", no_input)
+    core.save(tmp_nc, {"vec": [9.0, 8.0, 7.0]}, overwrite_value=True)
+
+    assert np.array_equal(ncf.read(tmp_nc, "vec"), [9.0, 8.0, 7.0])
+
+
+def test_save_rejects_uncastable_data(tmp_path: Path) -> None:
+    path = _fresh_file(tmp_path / "new.nc")
+
+    with pytest.raises(ValueError, match="Unable to casting"):
+        core.save(path, {"v": [[1, 2], [3]]})
+
+
+def test_save_rejects_non_1d_dimension(tmp_path: Path) -> None:
+    path = _fresh_file(tmp_path / "new.nc")
+
+    data = {"v": np.zeros(2), "bad": np.zeros((2, 2))}
+    with pytest.raises(ValueError, match="ndim==1"):
+        core.save(path, data)
+
+
+def test_save_rejects_empty_data(tmp_path: Path) -> None:
+    path = _fresh_file(tmp_path / "new.nc")
+
+    with pytest.raises(ValueError, match="empty"):
+        core.save(path, {"v": np.zeros(0)})
+
+    with pytest.raises(ValueError, match="empty"):
+        core.save(path, {"v": np.zeros((2, 2)), "d": np.array([])})
+
+
+def test_try_from_cache_refreshes_on_mtime_change(tmp_nc: Path) -> None:
+    ds1 = core.DatasetMeta.try_from_cache(tmp_nc)
+    mtime = tmp_nc.stat().st_mtime
+
+    with nc.Dataset(tmp_nc, "a") as h:
+        h["lon"].long_name = "changed longitude"
+
+    os.utime(tmp_nc, (mtime + 10, mtime + 10))  # defeat timestamp granularity
+
+    ds2 = core.DatasetMeta.try_from_cache(tmp_nc)
+    assert ds2 is ds1  # same cached instance, refreshed in place
+    assert ds2.variables["lon"].attributes["long_name"] == "changed longitude"

@@ -1,5 +1,7 @@
+from __future__ import annotations
+
 import warnings
-from collections.abc import Iterable
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from functools import partial
 from pathlib import Path
@@ -7,6 +9,7 @@ from typing import Any, ClassVar, Literal
 
 import netCDF4 as nc
 import numpy as np
+from numpy.typing import ArrayLike
 
 PathLike = str | Path
 
@@ -26,7 +29,7 @@ class VariableMeta:
 class DatasetMeta:
     variables: dict[str, VariableMeta]
     attributes: dict[str, Any]
-    cached_registry: ClassVar[dict[str, DatasetMeta]] = {}
+    cached_registry: ClassVar[dict[str, "DatasetMeta"]] = {}
     MAX_CACHE: ClassVar[int] = 64
 
     def __init__(self, path: PathLike) -> None:
@@ -71,7 +74,7 @@ class DatasetMeta:
         return str(Path(path).resolve())
 
     @staticmethod
-    def try_from_cache(path: PathLike, cache_only: bool = False) -> DatasetMeta:
+    def try_from_cache(path: PathLike, cache_only: bool = False) -> "DatasetMeta":
         path = Path(path)
         key = DatasetMeta._to_cache_key(path)
         ds = DatasetMeta.cached_registry.get(key)
@@ -550,9 +553,10 @@ def write_attr(path: PathLike, var_name: str, attr_name: str, attr_val: Any) -> 
 def write(
     path: PathLike,
     var_name: str,
-    data: np.ndarray,
+    data: ArrayLike,
     subsets: tuple[slice, ...] | None = None,
 ) -> None:
+    data = np.asarray(data)
     if any(s == 0 for s in data.shape):
         raise ValueError(
             f"I'm not going to help you write an empty data of shape={data.shape} to {var_name=} in {path!s}"
@@ -576,16 +580,18 @@ def write(
                 f"length of input slices does not match ndim(variable), {expected=} {received=}"
             )
 
-    with nc.Dataset(path, "a") as h:
-        if subsets is None:
-            h[var_name][:] = data
-        else:
-            try:
-                h[var_name][subsets] = data
-            except Exception as e:  # noqa: BLE001
-                raise RuntimeError(
-                    f"{e!r}\nunable to write {var_name}({data.shape}) with {subsets=} to {var_name}({var_meta.shape}) in  {path!s}"
-                )
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=DeprecationWarning)
+        with nc.Dataset(path, "a") as h:
+            if subsets is None:
+                h[var_name][:] = data
+            else:
+                try:
+                    h[var_name][subsets] = data
+                except Exception as e:  # noqa: BLE001
+                    raise RuntimeError(
+                        f"{e!r}\nunable to write {var_name}({data.shape}) with {subsets=} to {var_name}({var_meta.shape}) in  {path!s}"
+                    )
 
 
 def create(
@@ -659,8 +665,8 @@ def create(
 
 def save(
     path: PathLike,
-    data: dict[str, np.ndarray | Iterable],
-    overwrite: bool = False,
+    data: Mapping[str, ArrayLike],
+    overwrite_value: bool = False,
     use_my_attrs: bool = True,
     significant_digits: None | int = None,
     dtype: nc.DatatypeType = np.float32,
@@ -675,29 +681,50 @@ def save(
         ...
         dimN_name: dimN_data,
     }
+    # or when variable == dim
+    data = {
+        var_name: var_data,
+    }
     """
-    try:
-        var_meta = _get_variable_meta(path, next(iter(data.keys())))
-    except (FileNotFoundError, KeyError) as __:
-        var_meta = None
+    # ---- overwrite protection
+    if not overwrite_value:
+        try:
+            var_name = next(iter(data.keys()))
+            var_meta = _get_variable_meta(path, var_name)
+        except (FileNotFoundError, KeyError) as __:
+            var_meta = None
 
-    # data check -- can cast to array?
-    data_casted = {}
+    if not overwrite_value and var_meta is not None:
+        for __ in range(10):
+            print(f"{var_name=} already exists in the file path {path!s}")
+            answer = input(
+                "Confirm to overwrite the values in the path? (y/n) "
+            ).lower()
+            if answer in ("y", "n", "yes", "no"):
+                break
+
+        if answer not in ("y", "yes"):
+            raise FileExistsError(
+                f"{var_name=} already exists in the file path {path!s}"
+            )
+
+    # ---- data check - can cast to array?
+    arrays: dict[str, np.ndarray] = {}
     for name, value in data.items():
         try:
-            data_casted[name] = np.asarray(value)
+            arrays[name] = np.asarray(value)
 
         except Exception as e:  # noqa: BLE001
             raise ValueError(f"{e!r}\nUnable to casting data of '{name}' to an array")
 
-    # data check -- is dim ndim=1 valid?
-    for i, (name, value) in enumerate(data_casted.items()):
+    # ---- data check - is ndim(dim) == 1?
+    for i, (name, value) in enumerate(arrays.items()):
         if (
-            (len(data_casted) == 1 and i == 0)  # the only entry (variable == dimension)
+            (len(data) == 1 and i == 0)  # the only entry (variable == dimension)
             or (i > 0)  # the dimensions
         ) and value.ndim != 1:
             raise ValueError(
-                f"expecting dimension {name}.ndim==1 but found (shape={*value.shape})"
+                f"expecting dimension {name}.ndim==1 but found shape={value.shape}"
             )
 
         if any(s == 0 for s in value.shape):
@@ -706,14 +733,14 @@ def save(
             )
 
     # ---- assign parameters to create and write functions
-    names = tuple(data_casted.keys())
+    names = tuple(data.keys())
 
     if len(names) == 1:
-        dim_names = names[0]
+        dim_names = (names[0],)
     else:
         dim_names = names[1:]
 
-    dim_specs = {name: len(data_casted[name]) for name in dim_names}
+    dim_specs = {name: len(arrays[name]) for name in dim_names}
 
     create(
         path,
@@ -725,3 +752,6 @@ def save(
         complevel,
         shuffle,
     )
+
+    for name, array in arrays.items():
+        write(path, name, array)
