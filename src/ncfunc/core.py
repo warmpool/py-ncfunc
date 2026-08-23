@@ -900,7 +900,8 @@ def _confirm_overwrite(path: PathLike, var_name: str) -> None:
 def save(
     path: PathLike,
     data: Mapping[str, ArrayLike],
-    overwrite_value: bool = False,
+    overwrite_var: bool = False,
+    overwrite_dim: bool = False,
     use_my_attrs: bool = True,
     significant_digits: None | int = None,
     dtype: DTypeSpec = np.float32,
@@ -924,21 +925,29 @@ def save(
 
     a missing file is created; existing dimensions are reused.
 
-    overwrite protection inspects the FIRST key only (the variable name;
-    the following keys are its dimension coordinates). when it already
-    exists, _confirm_overwrite asks on the terminal unless
-    overwrite_value=True skips the check.
+    overwrite protection is split by role: overwrite_var guards the
+    variable (the FIRST key) and overwrite_dim guards its dimension
+    coordinates (the REMAINING keys). when a guarded name already exists
+    in the file, _confirm_overwrite asks on the terminal; pass True for a
+    role to skip the question. a single-entry data dict has no separate
+    dimension coordinates, so overwrite_var covers it alone.
 
     remaining parameters pass through to create().
 
     raises ValueError when entries are empty, cannot be cast to arrays or
     a dimension is not 1-D, FileExistsError when overwrite is declined
     """
-    var_name = next(iter(data.keys()))
+    names = tuple(data.keys())
+    var_name = names[0]
 
     # ---- overwrite protection
-    if not overwrite_value and _has_variable(path, var_name):
+    if not overwrite_var and _has_variable(path, var_name):
         _confirm_overwrite(path, var_name)
+
+    if not overwrite_dim:
+        for dim_name in names[1:]:
+            if _has_variable(path, dim_name):
+                _confirm_overwrite(path, dim_name)
 
     # ---- data check - can cast to array?
     arrays: dict[str, np.ndarray] = {}
