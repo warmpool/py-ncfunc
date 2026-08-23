@@ -435,7 +435,7 @@ def test_save_overwrite_forced(tmp_nc: Path, monkeypatch: pytest.MonkeyPatch) ->
 def test_save_rejects_uncastable_data(tmp_path: Path) -> None:
     path = _fresh_file(tmp_path / "new.nc")
 
-    with pytest.raises(ValueError, match="Unable to casting"):
+    with pytest.raises(ValueError, match="cannot cast"):
         core.save(path, {"v": [[1, 2], [3]]})
 
 
@@ -469,3 +469,60 @@ def test_try_from_cache_refreshes_on_mtime_change(tmp_nc: Path) -> None:
     ds2 = core.DatasetMeta.try_from_cache(tmp_nc)
     assert ds2 is ds1  # same cached instance, refreshed in place
     assert ds2.variables["lon"].attributes["long_name"] == "changed longitude"
+
+
+# ---- error quality ----
+def test_errors_are_chained_and_contextual(tmp_nc: Path) -> None:
+    with pytest.raises(ValueError) as info:
+        ncf.read(tmp_nc, "data", (slice(None),) * 99)
+    assert info.value.__cause__ is not None
+    assert "path=" in str(info.value)
+
+    with pytest.raises(KeyError, match="'data'") as info:  # available vars listed
+        ncf.read(tmp_nc, "nonexistent")
+    assert str(tmp_nc) in str(info.value)
+
+    with pytest.raises(KeyError, match="cache"):
+        core.DatasetMeta.try_from_cache(tmp_nc.parent / "nope.nc", cache_only=True)
+
+
+def test_write_subset_failure_is_chained(tmp_nc: Path) -> None:
+    too_big = np.zeros((2, 2, 2))
+    with pytest.raises(ValueError) as info:
+        core.write(tmp_nc, "data", too_big, (slice(1), slice(1), slice(1)))
+    assert info.value.__cause__ is not None
+
+
+def test_read_within_non_monotonic_dim(tmp_path: Path) -> None:
+    path = _fresh_file(tmp_path / "new.nc")
+    core.save(path, {"d": [0.0, 1.0, 3.0, 2.0]})  # scrambled ordering
+
+    with pytest.raises(ValueError):
+        ncf.read_within(path, "d", ((None, None),), decode_time=False)
+
+
+def test_read_within_descending_dim(tmp_path: Path) -> None:
+    path = _fresh_file(tmp_path / "new.nc")
+    core.save(path, {"lon": [3.0, 2.0, 1.0, 0.0, -1.0]})
+
+    sample, dims = ncf.read_within(path, "lon", ((0.5, 2.5),), decode_time=False)
+    assert np.array_equal(sample, [1.0, 2.0])  # ascending despite desc storage
+    assert np.array_equal(dims[0], sample)
+
+
+def test_read_time_fixed_calendar_leap(tmp_path: Path) -> None:
+    path = tmp_path / "fixed.nc"
+    with nc.Dataset(path, "w") as h:
+        h.createDimension("t", 366)
+        v = h.createVariable("time", np.float64, ("t",))
+        v[:] = np.arange(366)
+        v.units = "days since 2024-01-01"
+        v.calendar = "365_day"
+
+    time = ncf.read_time(path)
+
+    # a noleap year has no Feb29: day 59 must land on Mar 1 (not Mar 2)
+    assert time[58] == dn.from_ymd(2024, 2, 28)
+    assert time[59] == dn.from_ymd(2024, 3, 1)
+    assert time[364] == dn.from_ymd(2024, 12, 31)
+    assert time[365] == dn.from_ymd(2025, 1, 1)

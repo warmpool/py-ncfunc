@@ -3,20 +3,29 @@ from __future__ import annotations
 import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass, field
-from functools import partial
 from pathlib import Path
-from typing import Any, ClassVar, Literal
+from typing import Any, ClassVar, Literal, cast
 
+import datenum as dn
 import netCDF4 as nc
 import numpy as np
 from numpy.typing import ArrayLike
 
 PathLike = str | Path
+StrOrStrs = str | tuple[str, ...]
+IntOrInts = int | tuple[int, ...]
+DTypeSpec = (
+    np.dtype[Any]
+    | str
+    | type[int | float | complex | bool | str | np.bool_ | np.number | np.str_]
+)
 
 
 # --------------metadata assets-----------------------
 @dataclass
 class VariableMeta:
+    """static description of a single variable inside a NetCDF file"""
+
     shape: tuple[int, ...]
     dimensions: tuple[str, ...]
     attributes: dict[str, Any] = field(default_factory=dict)
@@ -27,12 +36,27 @@ class VariableMeta:
 
 
 class DatasetMeta:
+    """
+    static description of a NetCDF file: its variables and root attributes.
+
+    instances are cheap snapshots built without reading any data values.
+    a module-level registry keeps the most recently used entries (up to
+    MAX_CACHE) keyed by resolved path; use try_from_cache() to reuse or
+    refresh them.
+    """
+
     variables: dict[str, VariableMeta]
     attributes: dict[str, Any]
-    cached_registry: ClassVar[dict[str, "DatasetMeta"]] = {}
+    cached_registry: ClassVar[dict[str, DatasetMeta]] = {}
     MAX_CACHE: ClassVar[int] = 64
 
     def __init__(self, path: PathLike) -> None:
+        """
+        read the file's structure into this instance and register it in the cache
+
+        raises FileNotFoundError if the path does not exist,
+        RuntimeError if the netcdf4 library cannot open it
+        """
         path = Path(path)
         if not path.is_file():
             raise FileNotFoundError(str(path))
@@ -40,10 +64,9 @@ class DatasetMeta:
         self.mtime = path.stat().st_mtime
         self._read(path)
 
-        for __, key in zip(  # uncaching the old entries
-            range(len(self.cached_registry) - self.MAX_CACHE), self.cached_registry
-        ):
-            self.cached_registry.pop(key)
+        # -- uncaching the old entries
+        while len(self.cached_registry) >= self.MAX_CACHE:
+            self.cached_registry.pop(next(iter(self.cached_registry)))
 
         # -- caching
         self.cached_registry[DatasetMeta._to_cache_key(path)] = self
@@ -64,23 +87,31 @@ class DatasetMeta:
                 }
                 self.attributes = {name: h.getncattr(name) for name in h.ncattrs()}
 
-        except Exception as e:  # noqa: BLE001
-            raise RuntimeError(
-                f"{e!r}\nnetcdf4 library is unable to read the file: {path!s}\n(see message above)"
-            )
+        except Exception as e:
+            msg = f"the netcdf4 library failed to read {path}"
+            raise RuntimeError(msg) from e
 
     @staticmethod
     def _to_cache_key(path: PathLike) -> str:
         return str(Path(path).resolve())
 
     @staticmethod
-    def try_from_cache(path: PathLike, cache_only: bool = False) -> "DatasetMeta":
+    def try_from_cache(path: PathLike, cache_only: bool = False) -> DatasetMeta:
+        """
+        return the metadata of the file, reusing the cache when possible
+
+        a fresh DatasetMeta is built when nothing is cached yet; a cached
+        entry is re-read when the file's mtime changed since caching.
+
+        raises KeyError if cache_only=True and the path is not cached,
+        FileNotFoundError if the path does not exist
+        """
         path = Path(path)
         key = DatasetMeta._to_cache_key(path)
         ds = DatasetMeta.cached_registry.get(key)
 
         if cache_only and ds is None:
-            raise KeyError("path is not registered")
+            raise KeyError(f"path is not registered in the metadata cache: {key}")
 
         if ds is None:
             return DatasetMeta(path)
@@ -94,6 +125,31 @@ class DatasetMeta:
 
 
 # -------------- helpers ---------------
+def _err_ctx(path: PathLike, var_name: str | None = None) -> str:
+    """standardized context suffix appended to error messages"""
+    if var_name is None:
+        return f" (path={path})"
+
+    return f" (path={path}, var='{var_name}')"
+
+
+def _as_str_tuple(value: StrOrStrs) -> tuple[str, ...]:
+    return value if isinstance(value, tuple) else (value,)
+
+
+def _as_int_tuple(value: IntOrInts) -> tuple[int, ...]:
+    return value if isinstance(value, tuple) else (value,)
+
+
+def _has_variable(path: PathLike, var_name: str) -> bool:
+    try:
+        _get_variable_meta(path, var_name)
+    except (FileNotFoundError, KeyError):
+        return False
+
+    return True
+
+
 def _get_variable_meta(path: PathLike, var_name: str) -> VariableMeta:
     ds = DatasetMeta.try_from_cache(path)
 
@@ -101,9 +157,12 @@ def _get_variable_meta(path: PathLike, var_name: str) -> VariableMeta:
         return ds.variables[var_name]
 
     except KeyError as e:
-        raise KeyError(
-            f"'{e!r}\n{var_name}' is not a variable name in {path!s} {tuple(ds.variables.keys())!s}"
+        available = tuple(ds.variables.keys())
+        msg = (
+            f"variable '{var_name}' does not exist in {path}, "
+            f"available variables: {available}"
         )
+        raise KeyError(msg) from e
 
 
 def _get_attribute_metas(path: PathLike, var_name: str) -> dict[str, Any]:
@@ -115,25 +174,44 @@ def _get_attribute_metas(path: PathLike, var_name: str) -> dict[str, Any]:
         return _get_variable_meta(path, var_name).attributes
 
 
-# ----------- metat data queries ------
+# ----------- meta data queries ------
 def var_names(path: PathLike) -> tuple[str, ...]:
-    """get the variable names in the file"""
+    """
+    get the variable names in the file, in file order
+
+    raises FileNotFoundError if the path does not exist
+    """
     ds = DatasetMeta.try_from_cache(path)
     return tuple(ds.variables.keys())
 
 
 def dim_names(path: PathLike, var_name: str) -> tuple[str, ...]:
-    """get the dimension names of a variable in the file"""
+    """
+    get the dimension names of a variable in the file, in dimension order
+
+    raises KeyError if the variable does not exist, FileNotFoundError if
+    the path does not exist
+    """
     return _get_variable_meta(path, var_name).dimensions
 
 
 def shape(path: PathLike, var_name: str) -> tuple[int, ...]:
-    """get the shape of a variable in the file"""
+    """
+    get the shape of a variable in the file
+
+    raises KeyError if the variable does not exist, FileNotFoundError if
+    the path does not exist
+    """
     return _get_variable_meta(path, var_name).shape
 
 
 def ndim(path: PathLike, var_name: str) -> int:
-    """get the ndim (rank) of a variable in the file"""
+    """
+    get the ndim (rank) of a variable in the file
+
+    raises KeyError if the variable does not exist, FileNotFoundError if
+    the path does not exist
+    """
     return len(_get_variable_meta(path, var_name).shape)
 
 
@@ -142,6 +220,9 @@ def attr_names(path: PathLike, var_name: str) -> tuple[str, ...]:
     get the attribute names of
         the file       if var_name == '/'
         the variable   else
+
+    raises KeyError if the variable does not exist, FileNotFoundError if
+    the path does not exist
     """
     attributes = _get_attribute_metas(path, var_name)
     return tuple(attributes.keys())
@@ -149,9 +230,12 @@ def attr_names(path: PathLike, var_name: str) -> tuple[str, ...]:
 
 def attr_val(path: PathLike, var_name: str, attr_name: str) -> Any:
     """
-    get the attribute values of
+    get an attribute value of
         the file       if var_name == '/'
         the variable   else
+
+    raises KeyError if the variable or the attribute does not exist,
+    FileNotFoundError if the path does not exist
     """
     attributes = _get_attribute_metas(path, var_name)
     return attributes[attr_name]
@@ -159,18 +243,25 @@ def attr_val(path: PathLike, var_name: str, attr_name: str) -> Any:
 
 def var_names_include(
     path: PathLike,
-    name_includes: str | tuple[str, ...],
-    accept_ndims: int | tuple[int, ...],
-    accept_counts: int | tuple[int, ...] = 1,
+    name_includes: StrOrStrs,
+    accept_ndims: IntOrInts,
+    accept_counts: IntOrInts = 1,
 ) -> tuple[str, ...]:
-    if isinstance(name_includes, str):
-        name_includes = (name_includes,)
+    """
+    find variable names containing any of the given substrings
 
-    if isinstance(accept_ndims, int):
-        accept_ndims = (accept_ndims,)
+    name_includes: substring(s) to search for; a plain str is one pattern
+    accept_ndims: accepted variable rank(s); a plain int is one value
+    accept_counts: acceptable number of matches for an unambiguous result
 
-    if isinstance(accept_counts, int):
-        accept_counts = (accept_counts,)
+    returns all matching variable names in file order
+
+    raises ValueError unless the number of matches is in accept_counts,
+    FileNotFoundError if the path does not exist
+    """
+    name_includes = _as_str_tuple(name_includes)
+    accept_ndims = _as_int_tuple(accept_ndims)
+    accept_counts = _as_int_tuple(accept_counts)
 
     ds = DatasetMeta.try_from_cache(path)
     candidates = tuple(
@@ -182,23 +273,37 @@ def var_names_include(
     if len(candidates) in accept_counts:
         return candidates
 
-    else:
-        raise ValueError(
-            f"unable to locate var names include {name_includes} with {accept_ndims=}, {accept_counts=} in path {path!s} -> found {candidates=}"
-        )
+    msg = (
+        f"unable to locate variable names including {name_includes} "
+        f"with ndim in {accept_ndims} and count in {accept_counts}, "
+        f"found {candidates}{_err_ctx(path)}"
+    )
+    raise ValueError(msg)
 
 
 def attr_names_include(
     path: PathLike,
     var_name: str,
-    name_includes: str | tuple[str, ...],
-    accept_counts: int | tuple[int, ...] = 1,
+    name_includes: StrOrStrs,
+    accept_counts: IntOrInts = 1,
 ) -> tuple[str, ...]:
-    if isinstance(name_includes, str):
-        name_includes = (name_includes,)
+    """
+    find attribute names containing any of the given substrings
 
-    if isinstance(accept_counts, int):
-        accept_counts = (accept_counts,)
+    name_includes: substring(s) to search for; a plain str is one pattern
+    accept_counts: acceptable number of matches for an unambiguous result;
+        pass (0, 1) to tolerate absence
+    var_name selects whose attributes to search: '/' for the file's root
+    attributes, a variable name otherwise
+
+    returns all matching attribute names in file order
+
+    raises ValueError unless the number of matches is in accept_counts,
+    KeyError if the variable does not exist, FileNotFoundError if the path
+    does not exist
+    """
+    name_includes = _as_str_tuple(name_includes)
+    accept_counts = _as_int_tuple(accept_counts)
 
     candidates = tuple(
         attr_name
@@ -209,29 +314,43 @@ def attr_names_include(
     if len(candidates) in accept_counts:
         return candidates
 
-    else:
-        raise ValueError(
-            f"unable to locate attr names of {var_name} include {name_includes} with {accept_counts=} in path {path!s} -> found {candidates=}"
-        )
+    msg = (
+        f"unable to locate attribute names of '{var_name}' including {name_includes} "
+        f"with count in {accept_counts}, found {candidates}{_err_ctx(path, var_name)}"
+    )
+    raise ValueError(msg)
 
 
-def _guess_time_name(path: str | PathLike) -> str:
-    time_name_guesses = ("time", "date", "TIME", "DATE", "Time", "Date")
+def _guess_time_name(path: PathLike) -> str:
+    guesses = ("time", "date", "TIME", "DATE", "Time", "Date")
     try:
-        return var_names_include(
-            path, time_name_guesses, accept_ndims=(1,), accept_counts=(1,)
-        )[0]
+        return var_names_include(path, guesses, accept_ndims=(1,), accept_counts=(1,))[
+            0
+        ]
 
     except ValueError as e:
-        raise ValueError(
-            f"{e!r}\nunable to guess the variable name of time dimension (from {var_names(path)} in {path!s})"
+        available = var_names(path)
+        msg = (
+            f"unable to guess the time variable among {guesses}, "
+            f"available variables: {available}{_err_ctx(path)}"
         )
+        raise ValueError(msg) from e
 
 
 # ----- readers ----
 def read(
     path: PathLike, var_name: str, subsets: tuple[slice, ...] | None = None
 ) -> np.ndarray:
+    """
+    read a variable into a numpy array
+
+    subsets: one slice per variable dimension, applied as
+        h[var_name][subsets]; None reads the whole variable
+
+    raises KeyError if the variable does not exist, FileNotFoundError if
+    the path does not exist, ValueError if the slices fail or would select
+    an empty array
+    """
     # check var_name here and hide the KeyError inside
     var_meta = _get_variable_meta(path, var_name)
 
@@ -241,17 +360,86 @@ def read(
         else:
             try:
                 data = h[var_name][subsets]
-            except Exception as e:  # noqa: BLE001
-                raise ValueError(
-                    f"{e!r}\nunable to read {var_name=}{var_meta.shape} with {subsets=} from {path!s}"
+            except Exception as e:
+                msg = (
+                    f"unable to read '{var_name}'({var_meta.shape}) "
+                    f"with {subsets=}{_err_ctx(path, var_name)}"
                 )
+                raise ValueError(msg) from e
 
     if any(s == 0 for s in data.shape):
         raise ValueError(
-            f"an empty array of {data.shape} is read with the given {subsets=} for {var_name=}({var_meta.shape}) in {path!r}"
+            f"an empty array of {data.shape} is read with {subsets=} "
+            f"for '{var_name}'({var_meta.shape}) in {path}"
         )
 
     return np.array(data)
+
+
+_DELTA_TABLE: dict[str, tuple[str, float]] = {
+    "second": ("day", 1 / 86400),
+    "seconds": ("day", 1 / 86400),
+    "minute": ("day", 1 / 1440),
+    "minutes": ("day", 1 / 1440),
+    "hour": ("day", 1 / 24),
+    "hours": ("day", 1 / 24),
+    "day": ("day", 1),
+    "days": ("day", 1),
+    "month": ("month", 1),
+    "months": ("month", 1),
+    "year": ("month", 12),
+    "years": ("month", 12),
+}
+
+_FIXED_CALENDARS = ("365_day", "365_days", "360_day", "360_days")
+
+
+def _parse_units(units: str, ctx: str) -> tuple[str, float, str]:
+    """parse CF-style units '<delta> since <epoch>' to (method, factor, epoch-string)"""
+    str_delta, sep, str_epoch = units.partition("since")
+
+    if not sep:
+        msg = f"cannot parse {units=} by the 'since' keyword{ctx}"
+        raise ValueError(msg)
+
+    try:
+        delta_method, delta = _DELTA_TABLE[str_delta.strip()]
+
+    except KeyError as e:
+        msg = f"unrecognized time unit delta={str_delta!r} in {units=}{ctx}"
+        raise ValueError(msg) from e
+
+    return delta_method, delta, str_epoch.strip()
+
+
+def _epoch_from_string(str_epoch: str) -> float:
+    if str_epoch == "1-1-1 00:00:00":  # weird origin time (CMIP6 models)
+        return dn.from_ymd(1, 1, 1)
+
+    return dn.from_string(str_epoch)
+
+
+def _decode_fixed_calendar(
+    epoch: float, time_value: np.ndarray, calendar: str
+) -> np.ndarray:
+    """decode time values of a fixed-length calendar (360_day or noleap/365_day)"""
+    days_per_year = int(calendar[:3])
+
+    year_epoch = dn.year(epoch)
+    remainder_epoch = epoch - dn.from_ymd(year_epoch, 1, 1)
+
+    years = year_epoch + time_value // days_per_year
+    remainders = remainder_epoch + time_value % days_per_year
+
+    cross_year = remainders >= days_per_year
+    years[cross_year] += 1
+    remainders[cross_year] -= days_per_year
+
+    datenums = dn.from_ymd(years, 1, 1) + remainders
+
+    # get rid of the extra day from Feb29
+    datenums[(remainders >= 59) & dn.is_leap_year(datenums)] += 1
+    return datenums
 
 
 def read_time(
@@ -261,25 +449,35 @@ def read_time(
     calendar_name: str | None = None,
     subset: slice | None = None,
 ) -> np.ndarray:
-    import datenum as dn
+    """
+    read and decode a time coordinate into datenum serial values
 
-    # ----------------------------------
-    # ---- auto configure the parameters
+    names of the time variable, of its units attribute and of its calendar
+    attribute are guessed when not given. units follow the CF convention
+    '<delta> since <epoch>' where delta is seconds/minutes/hours/days/
+    months/years. month-based units decode via datenum.add_month; day-based
+    ones decode against the calendar attribute:
 
+        standard/gregorian/... : epoch + value * delta
+        360_day or 365_day     : fixed-length-calendar decoding
+
+    subset limits which time values are read.
+
+    raises ValueError when names cannot be guessed or units cannot be
+    parsed, TypeError when the units value is not a string,
+    KeyError/FileNotFoundError when variables or attributes do not exist
+    """
     time_name = time_name or _guess_time_name(path)
 
     if unit_name is None:
-        unit_name_guesses = ("unit", "Unit", "UNIT")
         try:
             unit_name = attr_names_include(
-                path,
-                time_name,
-                unit_name_guesses,
-                accept_counts=(1,),
+                path, time_name, ("unit", "Unit", "UNIT"), accept_counts=(1,)
             )[0]
 
         except ValueError as e:
-            raise ValueError(f"{e!r}\nunable to guess the attribute name of time units")
+            msg = f"unable to guess the attribute name of time units{_err_ctx(path, time_name)}"
+            raise ValueError(msg) from e
 
     subset = subset or slice(None)
 
@@ -287,226 +485,205 @@ def read_time(
     # ---- parse the time units to delta and epoch
     units = attr_val(path, time_name, unit_name)
     if not isinstance(units, str):
-        raise TypeError(
-            f"{units=} is not of string type, found {type(units)}: ({time_name=}, {unit_name=}, {path!s})"
+        msg = (
+            f"time units must be a string, found {type(units).__name__}: {units!r} "
+            f"(path={path}, var='{time_name}', unit='{unit_name}')"
         )
-    try:
-        str_delta, str_epoch = str(units).split("since")
-    except ValueError as e:
-        raise ValueError(
-            f"{e!r}\ncannot parse {units=} to (delta and epoch) by 'since': ({time_name=}, {unit_name=}, {path!s})"
-        )
+        raise TypeError(msg)
 
-    str_epoch = str_epoch.strip()
-
-    # ----------------------------------
-    # ---- delta string -> value
-    str_delta = str_delta.strip()
-
-    dict_delta = {
-        "second": ("day", 1 / 86400),
-        "seconds": ("day", 1 / 86400),
-        "minute": ("day", 1 / 1440),
-        "minutes": ("day", 1 / 1440),
-        "hour": ("day", 1 / 24),
-        "hours": ("day", 1 / 24),
-        "day": ("day", 1),
-        "days": ("day", 1),
-        "month": ("month", 1),
-        "months": ("month", 1),
-        "year": ("month", 12),
-        "years": ("month", 12),
-    }
-
-    try:
-        delta_method, delta = dict_delta[str_delta]
-
-    except KeyError as e:
-        raise ValueError(
-            f"{e!r}\nunrecognized {str_delta=} ({time_name=}, {unit_name=}, {path!s})"
-        )
-
-    # ----------------------------------
-    # ---- epoch string -> value
-    if str_epoch == "1-1-1 00:00:00":  # weird origin time (CMIP6 models)
-        epoch = dn.from_ymd(1, 1, 1)
-    else:
-        epoch = dn.from_string(str_epoch)
+    ctx = _err_ctx(path, time_name)
+    delta_method, delta, str_epoch = _parse_units(units, ctx)
+    epoch = _epoch_from_string(str_epoch)
 
     # ----------------------------------
     # ----- lazy guess the calendar name here
     if delta_method == "day" and calendar_name is None:
-        calander_name_guesses = ("calendar", "Calendar", "CALENDAR")
         try:
             calendar_names = attr_names_include(
                 path,
                 time_name,
-                calander_name_guesses,
+                ("calendar", "Calendar", "CALENDAR"),
                 accept_counts=(0, 1),
             )
-
-            if calendar_names:
-                calendar_name = calendar_names[0]
+            calendar_name = calendar_names[0] if calendar_names else None
 
         except ValueError as e:
-            raise ValueError(
-                f"{e!r}\nunable to guess the attribute name of time calendar"
-            )
+            msg = f"unable to guess the attribute name of time calendar{ctx}"
+            raise ValueError(msg) from e
 
-    if calendar_name is not None:
-        calendar = attr_val(path, time_name, calendar_name)
-    else:
-        calendar = None
+    calendar = (
+        attr_val(path, time_name, calendar_name) if calendar_name is not None else None
+    )
 
     time_value = read(path, time_name, (subset,))
     if delta_method == "month":
         return dn.add_month(epoch, time_value * delta)
 
-    elif calendar not in ("365_day", "365_days", "360_day", "360_days"):
-        return epoch + time_value * delta
+    if isinstance(calendar, str) and calendar in _FIXED_CALENDARS:
+        return _decode_fixed_calendar(epoch, time_value, calendar)
+
+    return epoch + time_value * delta
+
+
+def _dim_bounds(
+    within: tuple[float | None, float | None],
+    values: np.ndarray,
+    *,
+    dim_name: str,
+    var_name: str,
+    path: PathLike,
+    is_time: bool,
+) -> tuple[np.ndarray, slice, bool]:
+    """
+    locate the index range covering `within` in an ascending or descending array
+
+    returns 1) the bounded dimension values 2) the matching slice 3) descending?
+    """
+
+    def fmt(value):  # raw datenum serials are unreadable in error messages
+        return dn.to_string(value) if is_time else value
+
+    bot, top = within
+    bot = -np.inf if bot is None else bot
+    top = np.inf if top is None else top
+
+    if bot > top:
+        msg = f"lower boundary {bot} exceeds upper boundary {top} in {within}{_err_ctx(path, dim_name)}"
+        raise ValueError(msg)
+
+    ctx = f", dim='{dim_name}' (path={path}, var='{var_name}')"
+    value_max = np.max(values)
+    if bot > value_max:
+        raise ValueError(
+            f"requested lower boundary={fmt(bot)} is above the maximum "
+            f"dimension value ({fmt(value_max)}){ctx}"
+        )
+
+    value_min = np.min(values)
+    if top < value_min:
+        raise ValueError(
+            f"requested upper boundary={fmt(top)} is below the minimum "
+            f"dimension value ({fmt(value_min)}){ctx}"
+        )
+
+    diff = values[1:] - values[:-1]
+    if np.all(diff >= 0):
+        is_reversed = False
+
+    elif np.all(diff <= 0):
+        is_reversed = True
+
     else:
-        days_per_year = int(calendar[:3])
+        msg = f"dimension values sometimes increase and sometimes decrease{ctx}"
+        raise ValueError(msg)
 
-        year_epoch = dn.year(epoch)
-        remainder_epoch = epoch - dn.from_ymd(year_epoch, 1, 1)
+    if np.any(diff == 0):
+        warnings.warn(
+            f"some dimension values neither increase nor decrease{ctx}",
+            RuntimeWarning,
+        )
 
-        years = year_epoch + time_value // days_per_year
-        remainders = remainder_epoch + time_value % days_per_year
+    (is_within,) = np.where((bot <= values) & (values <= top))
+    slice_within = slice(
+        is_within[0], is_within[-1] + 1
+    )  # need one more to include the last boundary
 
-        cross_year = remainders >= days_per_year
-        years[cross_year] += 1
-        remainders[cross_year] -= days_per_year
-
-        datenums = dn.from_ymd(years, 1, 1) + remainders
-
-        # get rid of the extra day from Feb29
-        datenums[remainders >= 59 & dn.is_leap_year(datenums)] += 1
-        return datenums
+    bounded = values[is_within]
+    return bounded[::-1] if is_reversed else bounded, slice_within, is_reversed
 
 
 def read_within(
-    path: str | PathLike,
+    path: PathLike,
     var_name: str,
     withins: tuple[tuple[float | None, float | None], ...],
     idim_time: int | None = None,
-    decode_time=True,
-) -> tuple[np.ndarray, tuple[np.ndarray]]:
-    """withins specifies the values of dimensions for subset reading"""
-    ### figure out idim_time if not given
+    decode_time: bool = True,
+) -> tuple[np.ndarray, tuple[np.ndarray, ...]]:
+    """
+    read a variable within bounds given per dimension, plus the bounded coordinates
+
+    withins holds one (lower, upper) pair per dimension of the variable;
+    None means unbounded on that side. each pair must satisfy
+    lower <= upper and intersect the coordinate range.
+
+    the time dimension is located by idim_time, an index into the
+    variable's dimensions, or - by default - by guessing a time-named
+    coordinate variable. decode_time=False disables time handling
+    entirely; idim_time must then be None. bounds are matched against
+    decoded datenum values when time decoding applies.
+
+    coordinates are returned in ascending order even when stored
+    descending; the data is flipped accordingly so it stays aligned.
+
+    returns (values, coords) with coords a tuple of the bounded coordinate
+    array of each dimension, in dimension order
+
+    raises ValueError on conflicting arguments, a bound-count mismatch,
+    invalid or non-intersecting bounds or non-monotonic dimensions,
+    KeyError if the variable or one of its coordinates is missing,
+    FileNotFoundError if the path does not exist
+    """
     var_meta = _get_variable_meta(path, var_name)
 
+    ### figure out the time dimension name if needed
     if idim_time is not None and not decode_time:
-        raise ValueError(f"{idim_time=} is specified by {decode_time=}")
+        raise ValueError(f"{idim_time=} conflicts with {decode_time=}")
 
-    elif idim_time is not None and decode_time:
+    if idim_time is not None:
         try:
-            time_name = var_meta.dimensions[idim_time]
+            time_name: str | None = var_meta.dimensions[idim_time]
 
         except IndexError as e:
-            raise IndexError(
-                f"{e!r}\n{var_name=} only has ndim={var_meta.ndim} but {idim_time=} is requested: {path!s}"
+            msg = (
+                f"'{var_name}' only has ndim={var_meta.ndim} but dimension "
+                f"{idim_time} is requested{_err_ctx(path, var_name)}"
             )
-    elif idim_time is None and decode_time:
+            raise IndexError(msg) from e
+
+    elif decode_time:
         time_name = _guess_time_name(path)
 
-    elif idim_time is None and not decode_time:
+    else:
         time_name = None
 
     ### validate the withins
     if len(withins) != var_meta.ndim:
-        raise ValueError(
-            f"ndim={var_meta.ndim} but only {len(withins)} elements are given in {withins}. {var_name=}, {path!s}"
+        msg = (
+            f"expecting {var_meta.ndim} bounds but received {len(withins)}: "
+            f"{withins}, var='{var_name}' (path={path})"
         )
+        raise ValueError(msg)
 
-    def dim_info(
-        dim_name: str, within: tuple[float | None, float | None]
-    ) -> tuple[np.ndarray, slice, bool]:
-        """
-        return 1) the dimension 2) slice for the within in the file 3) needs to be flipped
-        """
-
-        bot, top = within
-        bot = bot if bot is not None else -np.inf
-        top = top if top is not None else np.inf
-
-        if bot > top:
-            raise ValueError(f"value1 > value2 in {within} does not make sense")
-
-        if dim_name != time_name:
-            values = read(path, dim_name)
-        else:
-            values = read_time(path, dim_name)
-
-        value_max = np.max(values)
-        if bot > value_max:
-            if dim_name == time_name:
-                from datenum import to_string
-
-                bot, value_max = to_string(bot), to_string(value_max)
-            raise ValueError(
-                f"requested lower boundary={bot} is larger than the maximum value of the array ({value_max}). {dim_name=}, {var_name=} {path!s}"
-            )
-
-        value_min = np.min(values)
-        if top < value_min:
-            if dim_name == time_name:
-                from datenum import to_string
-
-                top, value_min = to_string(top), to_string(value_min)
-            raise ValueError(
-                f"requested upper boundary={top} is smaller than the minimum value of the array ({value_min}). {dim_name=} {time_name=} {var_name=} {path!s}"
-            )
-
-        diff = values[1:] - values[:-1]
-        if np.all(diff >= 0):
-            is_reversed = False
-
-        elif np.all(diff <= 0):
-            is_reversed = True
-
-        else:
-            raise RuntimeError(
-                f"dimension value sometimes increases and sometimes decreases. {dim_name=} {path!s}"
-            )
-
-        if np.any(diff == 0):
-            warnings.warn(
-                f"some dimension values does not increase or decrease in {dim_name=} {path!s}",
-                RuntimeWarning,
-            )
-
-        if is_reversed:
-            bot, top = top, bot
-
-        (is_within,) = np.where(np.logical_and(bot <= values, values <= top))
-        slice_within = slice(
-            is_within[0], is_within[-1] + 1
-        )  # need one more to include the last boundary
-
-        if is_reversed:
-            values = np.flip(values[is_within])
-
-        return values[is_within], slice_within, is_reversed
-
-    dims, slices, are_reversed = list(
-        zip(
-            *[
-                dim_info(dim_name, within)
-                for dim_name, within in zip(var_meta.dimensions, withins)
-            ]
+    ### locate the bounds of every dimension
+    dims = []
+    slices = []
+    are_reversed = []
+    for dim_name, within in zip(var_meta.dimensions, withins):
+        is_time = dim_name == time_name
+        values = read_time(path, dim_name) if is_time else read(path, dim_name)
+        bounded, slice_within, is_reversed = _dim_bounds(
+            within,
+            values,
+            dim_name=dim_name,
+            var_name=var_name,
+            path=path,
+            is_time=is_time,
         )
-    )
+        dims.append(bounded)
+        slices.append(slice_within)
+        are_reversed.append(is_reversed)
 
+    ### read the variable and un-flip dimensions that were reversed
     value = np.flip(
-        read(path, var_name, slices),
-        axis=tuple(i for i, is_reversed in enumerate(are_reversed) if is_reversed),
+        read(path, var_name, tuple(slices)),
+        axis=[i for i, is_reversed in enumerate(are_reversed) if is_reversed],
     )
 
-    return value, dims
+    return value, tuple(dims)
 
 
 # ----- writers ----
-def _set_my_attrs(h_file: nc.Dataset, name: str):
+def _set_my_attrs(h_file: nc.Dataset, name: str) -> None:
     h = h_file[name]
     if name.lower() in ("lon", "longitude", "longitudes"):
         h.axis = "X"
@@ -540,14 +717,22 @@ def _set_my_attrs(h_file: nc.Dataset, name: str):
         h.standard_name = "time"
 
 
-def write_attr(path: PathLike, var_name: str, attr_name: str, attr_val: Any) -> None:
-    # hide the KeyError and FileNotFoundError here
+def write_attr(path: PathLike, var_name: str, attr_name: str, value: Any) -> None:
+    """
+    set an attribute of
+        the file       if var_name == '/'
+        the variable   else
+
+    raises KeyError if the variable does not exist, FileNotFoundError if
+    the path does not exist
+    """
+    # check var_name here; KeyError and FileNotFoundError surface from here
     _get_variable_meta(path, var_name)
     with nc.Dataset(path, "a") as h_file:
         if var_name == "/":
-            h_file.setncattr(attr_name, attr_val)
+            h_file.setncattr(attr_name, value)
         else:
-            setattr(h_file[var_name], attr_name, attr_val)
+            setattr(h_file[var_name], attr_name, value)
 
 
 def write(
@@ -556,13 +741,24 @@ def write(
     data: ArrayLike,
     subsets: tuple[slice, ...] | None = None,
 ) -> None:
+    """
+    write data into an existing variable, fully or by slices
+
+    without subsets, data.shape must equal the variable's shape. with
+    subsets (one slice per dimension), len(subsets) must equal the
+    variable's ndim; netCDF4 then applies its own shape/broadcast rules.
+
+    raises ValueError on empty data, mismatched shapes or failing slices,
+    KeyError if the variable does not exist, FileNotFoundError if the path
+    does not exist
+    """
     data = np.asarray(data)
     if any(s == 0 for s in data.shape):
         raise ValueError(
             f"I'm not going to help you write an empty data of shape={data.shape} to {var_name=} in {path!s}"
         )
 
-    # check var_name here and hide the and FileNotFoundError KeyError inside
+    # check var_name here; FileNotFoundError and KeyError surface from here
     var_meta = _get_variable_meta(path, var_name)
 
     # check the data shape
@@ -588,10 +784,13 @@ def write(
             else:
                 try:
                     h[var_name][subsets] = data
-                except Exception as e:  # noqa: BLE001
-                    raise RuntimeError(
-                        f"{e!r}\nunable to write {var_name}({data.shape}) with {subsets=} to {var_name}({var_meta.shape}) in  {path!s}"
+                except Exception as e:
+                    msg = (
+                        f"unable to write data of shape={data.shape} to "
+                        f"'{var_name}'({var_meta.shape}) with {subsets=}"
+                        f"{_err_ctx(path, var_name)}"
                     )
+                    raise ValueError(msg) from e
 
 
 def create(
@@ -600,67 +799,102 @@ def create(
     dim_specs: dict[str, int],
     use_my_attrs: bool = True,
     significant_digits: None | int = None,
-    dtype: nc.DatatypeType = np.float32,
+    dtype: DTypeSpec = np.float32,
     complevel: Literal[0, 1, 2, 3, 4, 5, 6, 7, 8, 9] | None = 4,
     shuffle: bool = True,
-):
-    """create a varaible and its dimensions in a file if any of them do not exist yet"""
+) -> None:
+    """
+    create a variable and its dimensions in a file, skipping existing parts
+
+    dim_specs maps dimension names to sizes, in the variable's dimension
+    order; the variable takes exactly this shape. missing dimensions are
+    created first (each as a coordinate variable of the same name); a
+    missing file is created on the fly.
+
+    if the variable already exists, its shape and dimension names must
+    match dim_specs exactly and nothing is written - calls are idempotent.
+    when the variable doubles as its own first dimension (e.g. a
+    coordinate), it is created as part of the dimension step above.
+
+    use_my_attrs stamps CF-ish axis/units/long_name attributes onto
+    created coordinate variables recognised as lon/lat/level/time-like.
+    dtype accepts anything np.dtype understands ('f4', np.float32, ...);
+    complevel > 0 enables zlib compression with the given level and
+    shuffle filter.
+
+    raises ValueError when an existing variable disagrees with dim_specs
+    """
     shape = tuple(dim_specs.values())
     dim_names = tuple(dim_specs.keys())
 
     # ----- check the consistency of shape and dimnames if variable already exists
     try:
         var_meta = _get_variable_meta(path, var_name)
-    except (KeyError, FileNotFoundError) as __:
+    except (KeyError, FileNotFoundError):
         var_meta = None
 
     if var_meta is not None:  # if the var_name exists in the file
         if shape != var_meta.shape:
             raise ValueError(
-                f"The shape of the {var_name=} is different in the input ({shape}) and the existing file ({var_meta.shape}) in {path!s}"
+                f"shape of '{var_name}' differs between the input ({shape}) "
+                f"and the existing file ({var_meta.shape}) (path={path})"
             )
-        elif dim_names != var_meta.dimensions:
-            raise ValueError(
-                f"The dimension names of the {var_name=} is different in the input ({dim_names}) and the existing file ({var_meta.dimensions}) in {path!s}"
-            )
-        else:  # everythin checks and nothing to do here
-            return
 
-    # ----- create the dimensions
+        if dim_names != var_meta.dimensions:
+            raise ValueError(
+                f"dimension names of '{var_name}' differ between the input ({dim_names}) "
+                f"and the existing file ({var_meta.dimensions}) (path={path})"
+            )
+
+        return  # everything checks out and nothing to do here
+
     try:
         existing_names = var_names(path)
     except FileNotFoundError:
         existing_names = ()
 
-    # ----- prepare specs that need to be created
-    missing_spec = {
-        name: (shape if name == var_name else (dim_specs[name],))
-        for name in dict.fromkeys((*dim_names, var_name))
-        if name not in existing_names
+    missing_dims = {
+        name: size for name, size in dim_specs.items() if name not in existing_names
+    }
+
+    kwargs: dict[str, Any] = {
+        "significant_digits": significant_digits,
+        "compression": "zlib",
+        "complevel": complevel,
+        "shuffle": shuffle,
     }
 
     with nc.Dataset(path, "a") as h_file:
-        for name, shape in missing_spec.items():
-            # create dimension and write attributes first
-            if name in dim_specs:
-                h_file.createDimension(name, shape[0])
-                create_var = h_file.createVariable
-                sub_dim_names = (name,)
-
-            else:
-                create_var = partial(
-                    h_file.createVariable,
-                    significant_digits=significant_digits,
-                    compression="zlib",
-                    complevel=complevel,
-                    shuffle=shuffle,
-                )
-                sub_dim_names = dim_names
-
-            create_var(name, dtype, sub_dim_names)
-
-            if use_my_attrs and name in dim_specs:
+        # create the dimension variables first
+        # note: nc.DatatypeType only exists in netCDF4's type stubs, hence cast()
+        for name, size in missing_dims.items():
+            h_file.createDimension(name, size)
+            h_file.createVariable(name, cast("nc.DatatypeType", dtype), (name,))
+            if use_my_attrs:
                 _set_my_attrs(h_file, name)
+
+        # then the variable itself (unless it is one of the dimensions above,
+        # i.e. the variable is its own dimension and already exists)
+        if var_name not in missing_dims:
+            h_file.createVariable(
+                var_name, cast("nc.DatatypeType", dtype), dim_names, **kwargs
+            )
+
+
+def _confirm_overwrite(path: PathLike, var_name: str) -> None:
+    """interactively confirm overwriting; declines after 10 invalid answers"""
+    print(f"{var_name=} already exists in the file path {path!s}")
+
+    valid = ("y", "n", "yes", "no")
+    for _ in range(10):
+        answer = input("Confirm to overwrite the values in the path? (y/n) ").lower()
+        if answer in valid:
+            break
+    else:
+        answer = "n"
+
+    if answer not in ("y", "yes"):
+        raise FileExistsError(f"{var_name=} already exists in {path}")
 
 
 def save(
@@ -669,44 +903,42 @@ def save(
     overwrite_value: bool = False,
     use_my_attrs: bool = True,
     significant_digits: None | int = None,
-    dtype: nc.DatatypeType = np.float32,
+    dtype: DTypeSpec = np.float32,
     complevel: Literal[0, 1, 2, 3, 4, 5, 6, 7, 8, 9] | None = 4,
     shuffle: bool = True,
-):
+) -> None:
     """
-    call create() and write() to save a variable to the file
-    data = {
-        var_name: var_data,
-        dim1_name: dim1_data,
-        ...
-        dimN_name: dimN_data,
-    }
-    # or when variable == dim
-    data = {
-        var_name: var_data,
-    }
+    save a variable and its dimension coordinates to a file in one call
+
+    the first entry is the variable, the rest are its dimension
+    coordinates (each 1-D), or - when the variable is its own dimension -
+    it is the only entry:
+
+        data = {
+            var_name: var_data,
+            dim1_name: dim1_data,
+            ...
+            dimN_name: dimN_data,
+        }
+        data = {var_name: var_data}   # variable == its own dimension
+
+    a missing file is created; existing dimensions are reused.
+
+    overwrite protection inspects the FIRST key only (the variable name;
+    the following keys are its dimension coordinates). when it already
+    exists, _confirm_overwrite asks on the terminal unless
+    overwrite_value=True skips the check.
+
+    remaining parameters pass through to create().
+
+    raises ValueError when entries are empty, cannot be cast to arrays or
+    a dimension is not 1-D, FileExistsError when overwrite is declined
     """
+    var_name = next(iter(data.keys()))
+
     # ---- overwrite protection
-    if not overwrite_value:
-        try:
-            var_name = next(iter(data.keys()))
-            var_meta = _get_variable_meta(path, var_name)
-        except (FileNotFoundError, KeyError) as __:
-            var_meta = None
-
-    if not overwrite_value and var_meta is not None:
-        for __ in range(10):
-            print(f"{var_name=} already exists in the file path {path!s}")
-            answer = input(
-                "Confirm to overwrite the values in the path? (y/n) "
-            ).lower()
-            if answer in ("y", "n", "yes", "no"):
-                break
-
-        if answer not in ("y", "yes"):
-            raise FileExistsError(
-                f"{var_name=} already exists in the file path {path!s}"
-            )
+    if not overwrite_value and _has_variable(path, var_name):
+        _confirm_overwrite(path, var_name)
 
     # ---- data check - can cast to array?
     arrays: dict[str, np.ndarray] = {}
@@ -714,18 +946,20 @@ def save(
         try:
             arrays[name] = np.asarray(value)
 
-        except Exception as e:  # noqa: BLE001
-            raise ValueError(f"{e!r}\nUnable to casting data of '{name}' to an array")
+        except Exception as e:
+            msg = f"cannot cast data of '{name}' to a numpy array"
+            raise ValueError(msg) from e
 
     # ---- data check - is ndim(dim) == 1?
     for i, (name, value) in enumerate(arrays.items()):
         if (
-            (len(data) == 1 and i == 0)  # the only entry (variable == dimension)
+            (len(arrays) == 1 and i == 0)  # the only entry (variable == dimension)
             or (i > 0)  # the dimensions
         ) and value.ndim != 1:
-            raise ValueError(
-                f"expecting dimension {name}.ndim==1 but found shape={value.shape}"
+            msg = (
+                f"expecting dimension '{name}' with ndim==1, found shape={value.shape}"
             )
+            raise ValueError(msg)
 
         if any(s == 0 for s in value.shape):
             raise ValueError(
