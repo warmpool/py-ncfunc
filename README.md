@@ -18,7 +18,9 @@ variable name, dimension name, etc.
 [datenum](https://pypi.org/project/datenum/) serials, including fixed-length
 calendars (`360_day`, `365_day`)
 - **Bounds-based subsetting** - `read_within` slices variables by coordinate
-ranges instead of index arithmetic
+  ranges instead of index arithmetic
+- **Multi-file reads** - `read_mf_within` reads the same variable across many
+  files and combines the results along a time or spatial axis
 - **Cached metadata** - structure queries reuse a path-keyed cache that
 auto-refreshes when a file's mtime changes (`DatasetMeta`)
 - **One-shot writer** - `save()` creates dimensions, coordinates and the
@@ -56,6 +58,7 @@ file = "tests/ersst_2022-2024.nc"
 | `read(path, var, subsets?)` | read a variable into `np.ndarray` |
 | `read_time(path, ...)` | read and decode a time coordinate to datenum values |
 | `read_within(path, var, withins, ...)` | bounds-based subset read with coordinates |
+| `read_mf_within(paths, var, withins, ...)` | bounds-based read across many files, combined along an axis |
 | `write(path, var, data, subsets?)` | write into an existing variable |
 | `create(path, var, dim_specs, ...)` | create a variable (+ dimensions), idempotently |
 | `save(path, data, ...)` | create + write a variable and its coordinates in one call |
@@ -132,6 +135,27 @@ The time dimension is found by guessing a time-named coordinate; point at it
 explicitly with `idim_time=<index>` if the guess would be wrong, or disable
 time handling with `decode_time=False`.
 
+### Read across many files
+
+`read_mf_within` applies the same bounds-based read to every file in a list and
+combines the results. With `stacked_along=None` a new leading axis is prepended
+(one slice per file, in path order); with an integer `stacked_along` the values
+(and that coordinate) are concatenated along the given dimension - typically
+the time axis of files split by time:
+
+```python
+tiles = [f"era5_2022-{m:02d}.nc" for m in range(1, 13)]
+tas, (time, lat, lon) = ncf.read_mf_within(
+    tiles,
+    "tas",
+    withins=((None, None), (-30.0, 30.0), (150.0, 210.0)),
+    stacked_along=0,          # concatenate along the time axis
+)
+```
+
+Non-stacked coordinates are taken from the last file, so tiles are expected to
+share them.
+
 ### Write data
 
 `save` writes a variable plus its dimensions in one shot. The first entry is
@@ -160,10 +184,14 @@ For finer control, use the pieces directly:
 
 ```python
 ncf.create(path, "tas", {"time": 3, "lon": 4})   # idempotent; missing dims created
+ncf.create(path, "tas", {"time": 3, "lon": 4}, chunksizes=(1, 4))  # chunk the variable
 ncf.write(path, "tas", data)                     # full write, shape must match
 ncf.write(path, "tas", data, ((slice(0, 1), slice(None)),))   # or by slices
 ncf.write_attr(path, "/", "history", "created today")         # '/' = root attribute
 ```
+
+`create` accepts an optional `chunksizes` (one size per dimension) to set the
+variable's HDF5 chunk shape; it defaults to netCDF4's own chunking.
 
 ## Development
 

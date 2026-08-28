@@ -16,6 +16,7 @@ from .core import (
     write,
     write_attr,
 )
+from .read_mf import read_mf_within
 
 __all__ = [
     "DatasetMeta",
@@ -26,6 +27,7 @@ __all__ = [
     "dim_names",
     "ndim",
     "read",
+    "read_mf_within",
     "read_time",
     "read_within",
     "save",

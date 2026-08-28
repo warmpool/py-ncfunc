@@ -31,10 +31,12 @@ uv run ruff format --check src/ tests/
 ```
 src/ncfunc/
   __init__.py   # Public API exports
-  core.py       # All functionality: DatasetMeta, readers, writers
+  core.py       # Core functionality: DatasetMeta, readers, writers
+  read_mf.py    # Multi-file reader: read_mf_within
 tests/
-  test_core.py  # pytest tests (14 tests)
-  nctools.py    # Legacy helper functions used in tests
+  test_core.py    # pytest tests
+  test_read_mf.py # pytest tests for read_mf_within
+  create_toync.py # Helper that generates dataa*.nc fixture files
   ersst_2022-2024.nc  # Test fixture NetCDF file
 ```
 
@@ -44,7 +46,7 @@ tests/
 - `DatasetMeta` caches file metadata in `cached_registry` class variable, invalidated by `mtime`
 - Time decoding uses `datenum` library, handles special calendars (365_day, 360_day)
 - `tests/nctools.py` provides reference implementations for test comparisons
-- Root-level `nctools.py` and `timetools.py` are gitignored (legacy files)
+- Legacy files `tests/nctools.py`, `tests/timetools.py`, `tests/multiNcRead.py` are gitignored
 
 ## Known Issue
 

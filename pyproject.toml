@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
 authors = [
-    { name = "lkkbox", email = "mail@mail.com" }
+    { name = "warmpool", email = "mail@mail.com" }
 ]
 requires-python = ">=3.10"
 dependencies = [
@@ -27,3 +27,6 @@ dev = [
 
 [tool.ruff.lint]
 extend-select = ["N802", "N803", "N806", "N815", "N816"]
+
+[project.urls]
+Homepage = "https://github.com/warmpool/py-ncfunc"

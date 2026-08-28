@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import warnings
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, ClassVar, Literal, cast
@@ -19,6 +19,7 @@ DTypeSpec = (
     | str
     | type[int | float | complex | bool | str | np.bool_ | np.number | np.str_]
 )
+MAX_DATASET_CACHE: int = 128
 
 
 # --------------metadata assets-----------------------
@@ -48,7 +49,6 @@ class DatasetMeta:
     variables: dict[str, VariableMeta]
     attributes: dict[str, Any]
     cached_registry: ClassVar[dict[str, DatasetMeta]] = {}
-    MAX_CACHE: ClassVar[int] = 64
 
     def __init__(self, path: PathLike) -> None:
         """
@@ -65,7 +65,7 @@ class DatasetMeta:
         self._read(path)
 
         # -- uncaching the old entries
-        while len(self.cached_registry) >= self.MAX_CACHE:
+        while len(self.cached_registry) >= MAX_DATASET_CACHE:
             self.cached_registry.pop(next(iter(self.cached_registry)))
 
         # -- caching
@@ -802,6 +802,7 @@ def create(
     dtype: DTypeSpec = np.float32,
     complevel: Literal[0, 1, 2, 3, 4, 5, 6, 7, 8, 9] | None = 4,
     shuffle: bool = True,
+    chunksizes: Sequence[int] | None = None,
 ) -> None:
     """
     create a variable and its dimensions in a file, skipping existing parts
@@ -820,7 +821,9 @@ def create(
     created coordinate variables recognised as lon/lat/level/time-like.
     dtype accepts anything np.dtype understands ('f4', np.float32, ...);
     complevel > 0 enables zlib compression with the given level and
-    shuffle filter.
+    shuffle filter. chunksizes sets the requested HDF5 chunk shape of the
+    variable (per dimension, in order); None leaves chunking to netCDF4's
+    default.
 
     raises ValueError when an existing variable disagrees with dim_specs
     """
@@ -862,6 +865,7 @@ def create(
         "compression": "zlib",
         "complevel": complevel,
         "shuffle": shuffle,
+        "chunksizes": chunksizes,
     }
 
     with nc.Dataset(path, "a") as h_file:

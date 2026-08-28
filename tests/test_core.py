@@ -227,9 +227,9 @@ def test_read_within() -> None:
     assert len(dims) == 1
     assert dims[0].shape == (21,)
 
-    sample, dims = ncf.read_within(TEST_FILE, "time", ((None, None),))
+    sample, __ = ncf.read_within(TEST_FILE, "time", ((None, None),))
     assert sample.shape == (36,)
-    sample, dims = ncf.read_within(
+    __, dims = ncf.read_within(
         TEST_FILE, "time", ((dn.from_ymd(2024, 1, 15), dn.from_ymd(2024, 12, 16)),)
     )
     assert dims[0][0] == dn.from_ymd(2024, 1, 15)
@@ -289,6 +289,19 @@ def test_create(tmp_nc: Path) -> None:
 
     with pytest.raises(ValueError):
         core.create(tmp_nc, "data", {"t": 99, "y": 99, "x": 99})
+
+
+def test_create_chunksizes(tmp_path: Path) -> None:
+    path = tmp_path / "chunked.nc"
+
+    core.create(path, "var", {"y": 6, "x": 4}, chunksizes=(2, 2))
+    with nc.Dataset(path) as h:
+        assert h["var"].chunking() == [2, 2]
+
+    path2 = tmp_path / "default.nc"
+    core.create(path2, "var", {"y": 6, "x": 4})
+    with nc.Dataset(path2) as h:
+        assert h["var"].chunking() == [6, 4]  # contiguous by default
 
 
 def test_set_my_attrs(tmp_nc: Path) -> None:
@@ -427,7 +440,7 @@ def test_save_overwrite_forced(tmp_nc: Path, monkeypatch: pytest.MonkeyPatch) ->
         raise AssertionError("input() must not be called")
 
     monkeypatch.setattr("builtins.input", no_input)
-    core.save(tmp_nc, {"vec": [9.0, 8.0, 7.0]}, overwrite_value=True)
+    core.save(tmp_nc, {"vec": [9.0, 8.0, 7.0]}, overwrite_var=True, overwrite_dim=True)
 
     assert np.array_equal(ncf.read(tmp_nc, "vec"), [9.0, 8.0, 7.0])
 
