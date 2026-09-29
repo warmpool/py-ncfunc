@@ -48,10 +48,6 @@ tests/
 - `tests/nctools.py` provides reference implementations for test comparisons
 - Legacy files `tests/nctools.py`, `tests/timetools.py`, `tests/multiNcRead.py` are gitignored
 
-## Known Issue
-
-Line 605 in `core.py` has syntax error: `except KeyError, FileNotFoundError:` should be `except (KeyError, FileNotFoundError):`
-
 ## Agent skills
 
 ### Issue tracker

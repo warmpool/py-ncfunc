@@ -43,6 +43,13 @@ def tmp_nc(tmp_path: Path) -> Path:
 
 
 # ---- helpers ---
+def _fresh_file(path: Path) -> Path:
+    """create an empty netcdf file"""
+    with nc.Dataset(path, "w"):
+        pass
+    return path
+
+
 def test_abort_missing_file() -> None:
     with pytest.raises(FileNotFoundError):
         core.DatasetMeta("no-such-path")
@@ -241,12 +248,56 @@ def test_write_attr(tmp_nc: Path) -> None:
     core.write_attr(tmp_nc, "data", "long_name", "test data")
     assert ncf.attr_val(tmp_nc, "data", "long_name") == "test data"
 
-    with nc.Dataset(tmp_nc, "a") as h:
-        h.setncattr("author", "tester")
-    assert ncf.attr_val(tmp_nc, "/", "author") == "tester"
-
-    with pytest.raises((KeyError, FileNotFoundError)):
+    # the file exists, so a missing variable is a KeyError, not a FileNotFoundError
+    with pytest.raises(KeyError, match="'nonexistent'"):
         core.write_attr(tmp_nc, "nonexistent", "attr", "val")
+
+
+def test_write_attr_root(tmp_nc: Path) -> None:
+    core.write_attr(tmp_nc, "/", "history", "created today")
+    assert ncf.attr_val(tmp_nc, "/", "history") == "created today"
+    assert "history" in ncf.attr_names(tmp_nc, "/")
+    assert ncf.attr_val(tmp_nc, "/", "title") == "test file"  # pre-existing survives
+
+
+def test_write_attr_root_variableless_file(tmp_path: Path) -> None:
+    path = _fresh_file(tmp_path / "bare.nc")  # no variables, so nothing could match '/'
+    core.write_attr(path, "/", "history", "created today")
+    assert ncf.var_names(path) == ()
+    assert ncf.attr_names(path, "/") == ("history",)
+
+
+def test_write_attr_root_creates_missing_file(tmp_path: Path) -> None:
+    path = tmp_path / "new.nc"
+    assert not path.exists()
+
+    core.write_attr(path, "/", "history", "created today")
+    assert path.exists()
+    assert ncf.var_names(path) == ()
+    assert ncf.attr_names(path, "/") == ("history",)
+
+    core.write_attr(path, "/", "source", "test")  # re-entry through the metadata cache
+    assert ncf.attr_names(path, "/") == ("history", "source")
+
+
+def test_write_attr_missing_file_variable(tmp_path: Path) -> None:
+    path = tmp_path / "absent.nc"
+    with pytest.raises(FileNotFoundError):
+        core.write_attr(path, "data", "attr", "val")
+    assert not path.exists()  # a variable write must not leave a stray file behind
+
+
+def test_write_attr_root_refreshes_cached_meta(tmp_path: Path) -> None:
+    path = _fresh_file(tmp_path / "bare.nc")
+    ds = core.DatasetMeta.try_from_cache(path)
+    mtime = path.stat().st_mtime
+
+    core.write_attr(path, "/", "history", "created today")
+    os.utime(path, (mtime + 10, mtime + 10))  # defeat timestamp granularity
+
+    ds2 = core.DatasetMeta.try_from_cache(path)
+    assert ds2 is ds  # same cached instance, refreshed in place
+    assert ds2.attributes["history"] == "created today"
 
 
 def test_write(tmp_nc: Path) -> None:
@@ -347,13 +398,6 @@ def test_attr_val_nonexistent(tmp_nc: Path) -> None:
 
 
 # ---- save tests ----
-def _fresh_file(path: Path) -> Path:
-    """create an empty netcdf file"""
-    with nc.Dataset(path, "w"):
-        pass
-    return path
-
-
 def test_save_new_variable(tmp_path: Path) -> None:
     path = _fresh_file(tmp_path / "new.nc")
 

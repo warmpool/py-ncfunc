@@ -723,11 +723,14 @@ def write_attr(path: PathLike, var_name: str, attr_name: str, value: Any) -> Non
         the file       if var_name == '/'
         the variable   else
 
-    raises KeyError if the variable does not exist, FileNotFoundError if
-    the path does not exist
+    only a root write creates the file when the path does not exist; a variable
+    write raises FileNotFoundError instead, leaving no file behind.
+
+    raises KeyError if the variable does not exist
     """
-    # check var_name here; KeyError and FileNotFoundError surface from here
-    _get_variable_meta(path, var_name)
+    if var_name != "/":  # check var_name here; KeyError and FileNotFoundError surface
+        _get_variable_meta(path, var_name)
+
     with nc.Dataset(path, "a") as h_file:
         if var_name == "/":
             h_file.setncattr(attr_name, value)
