@@ -116,7 +116,7 @@ wheels = [
 
 [[package]]
 name = "ncfunc"
-version = "0.1.0"
+version = "0.2.0"
 source = { editable = "." }
 dependencies = [
     { name = "datenum" },
@@ -135,7 +135,7 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "datenum", specifier = ">=0.1.0" },
-    { name = "netcdf4", specifier = ">=1.7.3" },
+    { name = "netcdf4", specifier = ">=1.6" },
     { name = "numpy", specifier = ">=1.24" },
 ]
 
