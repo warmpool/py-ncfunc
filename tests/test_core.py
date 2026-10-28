@@ -422,6 +422,18 @@ def test_save_new_variable(tmp_path: Path) -> None:
     assert ncf.attr_val(path, "lat", "units") == "degrees_north"
 
 
+def test_save_wrong_shape_error(tmp_path: Path) -> None:
+    path = _fresh_file(tmp_path / "new.nc")
+
+    data = {
+        "sst": np.random.rand(4, 3).astype(np.float32),
+        "time": np.arange(4),
+        "lat": np.arange(4),
+    }
+    with pytest.raises(ValueError):
+        core.save(path, data)
+
+
 def test_save_single_entry_var_is_dim(tmp_path: Path) -> None:
     path = _fresh_file(tmp_path / "new.nc")
 

@@ -966,7 +966,7 @@ def save(
             msg = f"cannot cast data of '{name}' to a numpy array"
             raise ValueError(msg) from e
 
-    # ---- data check - is ndim(dim) == 1?
+    # ---- data check
     for i, (name, value) in enumerate(arrays.items()):
         if (
             (len(arrays) == 1 and i == 0)  # the only entry (variable == dimension)
@@ -981,6 +981,13 @@ def save(
             raise ValueError(
                 f"I'm not going to help you write an empty data of shape={value.shape} to {name=}"
             )
+
+    if len(arrays) > 1:
+        shapes = tuple(v.shape for v in arrays.values())
+        var_shape = shapes[0]
+        dim_shape = tuple(s[0] for s in shapes[1:])
+        if var_shape != dim_shape:
+            raise ValueError(f"shapes differ: {var_shape=} {dim_shape=}")
 
     # ---- assign parameters to create and write functions
     names = tuple(data.keys())
