@@ -104,12 +104,12 @@ def test_meta_data() -> None:
 
 
 def test_cache() -> None:
-    ds1 = core.DatasetMeta.try_from_cache(TEST_FILE)
+    ds1 = core.DatasetMeta.get(TEST_FILE)
     assert len(core.DatasetMeta.cached_registry) == 1
-    ds2 = core.DatasetMeta.try_from_cache(TEST_FILE, cache_only=True)
+    ds2 = core.DatasetMeta.get(TEST_FILE, cache_only=True)
     assert len(core.DatasetMeta.cached_registry) == 1
     assert ds1 == ds2
-    core.DatasetMeta.try_from_cache(TEST_FILE)
+    core.DatasetMeta.get(TEST_FILE)
     assert len(core.DatasetMeta.cached_registry) == 1
 
 
@@ -302,13 +302,13 @@ def test_write_attr_missing_file_variable(tmp_path: Path) -> None:
 
 def test_write_attr_root_refreshes_cached_meta(tmp_path: Path) -> None:
     path = _fresh_file(tmp_path / "bare.nc")
-    ds = core.DatasetMeta.try_from_cache(path)
+    ds = core.DatasetMeta.get(path)
     mtime = path.stat().st_mtime
 
     core.write_attr(path, "/", "history", "created today")
     os.utime(path, (mtime + 10, mtime + 10))  # defeat timestamp granularity
 
-    ds2 = core.DatasetMeta.try_from_cache(path)
+    ds2 = core.DatasetMeta.get(path)
     assert ds2 is ds  # same cached instance, refreshed in place
     assert ds2.attributes["history"] == "created today"
 
@@ -571,7 +571,7 @@ def test_save_rejects_empty_data(tmp_path: Path) -> None:
 
 
 def test_try_from_cache_refreshes_on_mtime_change(tmp_nc: Path) -> None:
-    ds1 = core.DatasetMeta.try_from_cache(tmp_nc)
+    ds1 = core.DatasetMeta.get(tmp_nc)
     mtime = tmp_nc.stat().st_mtime
 
     with nc.Dataset(tmp_nc, "a") as h:
@@ -579,7 +579,7 @@ def test_try_from_cache_refreshes_on_mtime_change(tmp_nc: Path) -> None:
 
     os.utime(tmp_nc, (mtime + 10, mtime + 10))  # defeat timestamp granularity
 
-    ds2 = core.DatasetMeta.try_from_cache(tmp_nc)
+    ds2 = core.DatasetMeta.get(tmp_nc)
     assert ds2 is ds1  # same cached instance, refreshed in place
     assert ds2.variables["lon"].attributes["long_name"] == "changed longitude"
 
@@ -596,7 +596,7 @@ def test_errors_are_chained_and_contextual(tmp_nc: Path) -> None:
     assert str(tmp_nc) in str(info.value)
 
     with pytest.raises(KeyError, match="cache"):
-        core.DatasetMeta.try_from_cache(tmp_nc.parent / "nope.nc", cache_only=True)
+        core.DatasetMeta.get(tmp_nc.parent / "nope.nc", cache_only=True)
 
 
 def test_write_subset_failure_is_chained(tmp_nc: Path) -> None:

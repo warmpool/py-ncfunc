@@ -42,13 +42,14 @@ class DatasetMeta:
 
     instances are cheap snapshots built without reading any data values.
     a module-level registry keeps the most recently used entries (up to
-    MAX_CACHE) keyed by resolved path; use try_from_cache() to reuse or
-    refresh them.
+    MAX_CACHE) keyed by resolved path; use ALWAYS_FLUSH=True to reuse or
+    False to avoid them
     """
 
     variables: dict[str, VariableMeta]
     attributes: dict[str, Any]
     cached_registry: ClassVar[dict[str, DatasetMeta]] = {}
+    _always_flush: ClassVar[bool] = False
 
     def __init__(self, path: PathLike) -> None:
         """
@@ -106,6 +107,9 @@ class DatasetMeta:
         raises KeyError if cache_only=True and the path is not cached,
         FileNotFoundError if the path does not exist
         """
+        if get_always_flush():
+            return DatasetMeta(path)
+
         path = Path(path)
         key = DatasetMeta._to_cache_key(path)
         ds = DatasetMeta.cached_registry.get(key)
@@ -122,6 +126,22 @@ class DatasetMeta:
         else:
             ds._read(path)
             return ds
+
+    @staticmethod
+    def set_always_flush(stat: bool) -> None:
+        DatasetMeta._always_flush = stat
+
+    @staticmethod
+    def get_always_flush() -> bool:
+        return DatasetMeta._always_flush
+
+
+def set_always_flush(stat: bool) -> None:
+    DatasetMeta.set_always_flush(stat)
+
+
+def get_always_flush() -> bool:
+    return DatasetMeta.get_always_flush()
 
 
 # -------------- helpers ---------------
