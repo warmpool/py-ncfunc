@@ -1,1 +1,0 @@
-/home/lkkbox/projects/ncplot/tests/data/ersst_2022-2024.nc

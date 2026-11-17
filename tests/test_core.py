@@ -12,8 +12,7 @@ import ncfunc as ncf
 from ncfunc import core
 from tests import nctools as nct
 
-TEST_FILE = "tests/ersst_2022-2024.nc"
-TEST_FILE_LINK = "../ncplot/tests/data/file1.nc"
+TEST_FILE = "./tests/ersst.v6.202010.nc"
 
 
 @pytest.fixture
@@ -57,9 +56,16 @@ def test_abort_missing_file() -> None:
 
 def test_meta_data() -> None:
     ds = core.DatasetMeta(TEST_FILE)
-    assert tuple(v for v in ds.variables) == ("time", "lon", "lat", "sst", "ssta")
+    assert tuple(v for v in ds.variables) == (
+        "lat",
+        "lev",
+        "lon",
+        "sst",
+        "time",
+        "ssta",
+    )
 
-    assert ds.mtime == 1785817424.361744
+    assert ds.mtime == 1794888535.7641284
 
     assert ds.attributes["creator_name"] == "Boyin Huang"
     assert ds.attributes["creator_email"] == "boyin.huang@noaa.gov"
@@ -68,26 +74,32 @@ def test_meta_data() -> None:
     assert ds.variables["time"].dimensions == ("time",)
     assert ds.variables["lat"].dimensions == ("lat",)
     assert ds.variables["lon"].dimensions == ("lon",)
-    assert ds.variables["sst"].dimensions == ("time", "lat", "lon")
-    assert ds.variables["ssta"].dimensions == ("time", "lat", "lon")
+    assert ds.variables["sst"].dimensions == ("time", "lev", "lat", "lon")
+    assert ds.variables["ssta"].dimensions == ("time", "lev", "lat", "lon")
 
-    assert ds.variables["lon"].shape == (240,)
-    assert ds.variables["sst"].shape == (36, 121, 240)
+    assert ds.variables["lon"].shape == (180,)
+    assert ds.variables["sst"].shape == (1, 1, 89, 180)
 
     assert ds.variables["sst"].attributes == {
-        "standard_name": "sea_surface_temperature",
         "long_name": "Extended reconstructed sea surface temperature",
+        "standard_name": "sea_surface_temperature",
         "units": "degree_C",
-        "_FillValue": np.float32(-999.0),
-        "missing_value": np.float32(-999.0),
-        "cell_methods": "lev: mean",
+        "add_offset": float(0),
+        "scale_factor": float(1),
+        "valid_min": float(-3),
+        "valid_max": float(45),
+        "coordinates": "time lev lat lon",
+        "_FillValue": float(-999),
     }
     assert ds.variables["time"].attributes == {
-        "standard_name": "time",
-        "long_name": "Time",
-        "units": "days since 1850-01-15 00:00",
-        "calendar": "gregorian",
+        "_CoordinateAxisType": "Time",
+        "avg_period": "0000-01-00",
         "axis": "T",
+        "calendar": "gregorian",
+        "delta_t": "0000-01-00",
+        "long_name": "Time",
+        "standard_name": "time",
+        "units": "days since 1850-01-15 00:00",
     }
 
 
@@ -99,18 +111,16 @@ def test_cache() -> None:
     assert ds1 == ds2
     core.DatasetMeta.try_from_cache(TEST_FILE)
     assert len(core.DatasetMeta.cached_registry) == 1
-    core.DatasetMeta.try_from_cache(TEST_FILE_LINK)
-    assert len(core.DatasetMeta.cached_registry) == 1
 
 
 # ---- meta data queries ----
 def test_var_names() -> None:
-    assert ncf.var_names(TEST_FILE) == ("time", "lon", "lat", "sst", "ssta")
+    assert ncf.var_names(TEST_FILE) == ("lat", "lev", "lon", "sst", "time", "ssta")
 
 
 def test_dim_names() -> None:
-    assert ncf.dim_names(TEST_FILE, "ssta") == ("time", "lat", "lon")
-    assert ncf.dim_names(TEST_FILE, "sst") == ("time", "lat", "lon")
+    assert ncf.dim_names(TEST_FILE, "ssta") == ("time", "lev", "lat", "lon")
+    assert ncf.dim_names(TEST_FILE, "sst") == ("time", "lev", "lat", "lon")
     assert ncf.dim_names(TEST_FILE, "lon") == ("lon",)
 
     with pytest.raises(KeyError):
@@ -118,29 +128,32 @@ def test_dim_names() -> None:
 
 
 def test_shape() -> None:
-    assert ncf.shape(TEST_FILE, "lon") == (240,)
-    assert ncf.shape(TEST_FILE, "lat") == (121,)
-    assert ncf.shape(TEST_FILE, "time") == (36,)
-    assert ncf.shape(TEST_FILE, "sst") == (36, 121, 240)
-    assert ncf.shape(TEST_FILE, "ssta") == (36, 121, 240)
+    assert ncf.shape(TEST_FILE, "lon") == (180,)
+    assert ncf.shape(TEST_FILE, "lat") == (89,)
+    assert ncf.shape(TEST_FILE, "time") == (1,)
+    assert ncf.shape(TEST_FILE, "sst") == (1, 1, 89, 180)
+    assert ncf.shape(TEST_FILE, "ssta") == (1, 1, 89, 180)
 
 
 def test_ndim() -> None:
     assert ncf.ndim(TEST_FILE, "lon") == 1
     assert ncf.ndim(TEST_FILE, "lat") == 1
     assert ncf.ndim(TEST_FILE, "time") == 1
-    assert ncf.ndim(TEST_FILE, "sst") == 3
-    assert ncf.ndim(TEST_FILE, "ssta") == 3
+    assert ncf.ndim(TEST_FILE, "sst") == 4
+    assert ncf.ndim(TEST_FILE, "ssta") == 4
 
 
 def test_attr_names() -> None:
     assert ncf.attr_names(TEST_FILE, "sst") == (
-        "standard_name",
         "long_name",
+        "standard_name",
         "units",
+        "add_offset",
+        "scale_factor",
+        "valid_min",
+        "valid_max",
+        "coordinates",
         "_FillValue",
-        "missing_value",
-        "cell_methods",
     )
 
     root_attrs = ncf.attr_names(TEST_FILE, "/")
@@ -158,8 +171,8 @@ def test_attr_val() -> None:
         TEST_FILE,
         "time",
         gold={
-            "standard_name": "time",
             "long_name": "Time",
+            "standard_name": "time",
             "units": "days since 1850-01-15 00:00",
             "calendar": "gregorian",
             "axis": "T",
@@ -180,7 +193,7 @@ def test_attr_val() -> None:
 def test_var_name_includes() -> None:
     assert ncf.core.var_names_include(TEST_FILE, ("time", "date"), (1,)) == ("time",)
 
-    assert ncf.core.var_names_include(TEST_FILE, ("sst",), (3,), (1, 2)) == (
+    assert ncf.core.var_names_include(TEST_FILE, ("sst",), (4,), (1, 2)) == (
         "sst",
         "ssta",
     )
@@ -189,14 +202,14 @@ def test_var_name_includes() -> None:
         ncf.core.var_names_include(TEST_FILE, ("sst",), (1,))
 
     with pytest.raises(ValueError):
-        ncf.core.var_names_include(TEST_FILE, ("sst",), (3,))
+        ncf.core.var_names_include(TEST_FILE, ("sst",), (4,))
 
 
 def test_attr_name_includes() -> None:
     assert ncf.core.attr_names_include(TEST_FILE, "time", ("unit"), (1,)) == ("units",)
     assert ncf.core.attr_names_include(TEST_FILE, "time", ("name"), (2,)) == (
-        "standard_name",
         "long_name",
+        "standard_name",
     )
 
 
@@ -213,7 +226,7 @@ def test_read() -> None:
             ncf.read(TEST_FILE, var_name), nct.read(TEST_FILE, var_name)
         )
 
-    slices = (slice(5, 10), slice(10, 30), slice(-5))
+    slices = (slice(0, 1), slice(0, 1), slice(10, 30), slice(-5))
     assert np.array_equal(
         ncf.read(TEST_FILE, "sst", slices),
         nct.ncread(TEST_FILE, "sst", list(slices)),
@@ -223,24 +236,24 @@ def test_read() -> None:
 def test_read_time() -> None:
     time = ncf.read_time(TEST_FILE)
     ymd = dn.to_ymd(time)[:3]
-    assert ymd[0][0] == 2022
-    assert ymd[0][-1] == 2024
+    assert ymd[0][0] == 2020
+    assert ymd[0][-1] == 2020
     assert np.array_equal(ncf.read_time(TEST_FILE), nct.ncreadtime(TEST_FILE))
 
 
 def test_read_within() -> None:
     sample, dims = ncf.read_within(TEST_FILE, "lon", ((120, 150),))
-    assert sample.shape == (21,)
+    assert sample.shape == (16,)
     assert len(dims) == 1
-    assert dims[0].shape == (21,)
+    assert dims[0].shape == (16,)
 
     sample, __ = ncf.read_within(TEST_FILE, "time", ((None, None),))
-    assert sample.shape == (36,)
+    assert sample.shape == (1,)
     __, dims = ncf.read_within(
-        TEST_FILE, "time", ((dn.from_ymd(2024, 1, 15), dn.from_ymd(2024, 12, 16)),)
+        TEST_FILE, "time", ((dn.from_ymd(2020, 10, 15), dn.from_ymd(2020, 10, 15)),)
     )
-    assert dims[0][0] == dn.from_ymd(2024, 1, 15)
-    assert dims[0][-1] == dn.from_ymd(2024, 12, 15)
+    assert dims[0][0] == dn.from_ymd(2020, 10, 15)
+    assert dims[0][-1] == dn.from_ymd(2020, 10, 15)
 
 
 # ---- write tests ----
@@ -410,6 +423,37 @@ def test_save_new_variable(tmp_path: Path) -> None:
 
     # note: create() makes dimension variables first and the variable last
     assert ncf.var_names(path) == ("time", "lat", "sst")
+    assert ncf.dim_names(path, "sst") == ("time", "lat")
+    assert ncf.shape(path, "sst") == (4, 3)
+
+    for name, value in data.items():
+        assert np.array_equal(ncf.read(path, name), value)
+
+    assert ncf.attr_val(path, "time", "axis") == "T"
+    assert ncf.attr_val(path, "time", "units") == "days since 2000-01-01 00:00:00"
+    assert ncf.attr_val(path, "lat", "axis") == "Y"
+    assert ncf.attr_val(path, "lat", "units") == "degrees_north"
+
+
+def test_save_two_new_variable(tmp_path: Path) -> None:
+    # path = _fresh_file(tmp_path / "new.nc")
+    path = tmp_path / "new.nc"
+
+    data = {
+        "sst": np.random.rand(4, 3).astype(np.float32),
+        "time": np.arange(4),
+        "lat": np.arange(3),
+    }
+    data2 = {
+        "sst2": np.random.rand(4, 3).astype(np.float32),
+        "time": np.arange(4),
+        "lat": np.arange(3),
+    }
+    core.save(path, data)
+    core.save(path, data2, overwrite_dim=True)
+
+    # note: create() makes dimension variables first and the variable last
+    assert ncf.var_names(path) == ("time", "lat", "sst", "sst2")
     assert ncf.dim_names(path, "sst") == ("time", "lat")
     assert ncf.shape(path, "sst") == (4, 3)
 
